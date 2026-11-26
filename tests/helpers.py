@@ -1,4 +1,10 @@
+import hashlib
 import uuid
+from pathlib import Path
+
+from photokeep import events
+from photokeep.library import Library
+from photokeep.state import State, fold
 
 T0 = "2026-01-01T00:00:00.000000Z"
 T1 = "2026-01-01T00:00:01.000000Z"
@@ -22,3 +28,27 @@ def imp(item: str, *, name: str = "IMG_1.JPG", folder: str = "2024/01", ts: str 
         files.append({"role": "live", "name": live, "sha256": uuid.uuid4().hex, "size": 1, "mtime": ts})
     return ev("import", item, ts=ts, copy=copy, **{"import": uuid.uuid4().hex}, folder=folder,
               files=files, fingerprint=fingerprint, version_of=version_of)
+
+
+def sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def put(lib: Library, rel: str, data: bytes) -> Path:
+    path = lib.root / rel
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return path
+
+
+def state_with(lib: Library, data: bytes, *, name: str = "IMG_1.JPG", folder: str = "2024/01",
+               trashed: bool = False, purged: bool = False) -> State:
+    """Log an import of `data` (optionally trashed, then purged) to lib's log and fold the whole log."""
+    item = sha(data)
+    evs = [imp(item, name=name, folder=folder, copy=lib.copy_id)]
+    if trashed:
+        evs.append(ev("trash", item, ts=T1, copy=lib.copy_id))
+    if purged:
+        evs.append(ev("purge", item, ts=T2, copy=lib.copy_id))
+    events.append(lib, evs)
+    return fold(events.read_all(lib))

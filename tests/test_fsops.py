@@ -1,0 +1,197 @@
+import os
+
+import pytest
+
+from photokeep.fsops import CopyError, apply_layout, copy_verified, plan_layout, scan
+from photokeep.hashcache import HashCache
+from photokeep.state import fold
+from tests.helpers import T1, T2, T3, ev, imp, put, sha, state_with
+
+CLEAN = {"moves": 0, "deletes": 0, "missing": 0, "untracked": 0, "conflicts": 0}
+
+
+def test_trash_moves_file_into_trash_folder(lib, jpeg):
+    put(lib, "originals/2024/01/A.JPG", jpeg)
+    s = state_with(lib, jpeg, name="A.JPG", trashed=True)
+    plan = plan_layout(lib, s, scan(lib))
+    apply_layout(lib, plan)
+    assert (lib.root / f"trash/{sha(jpeg)}/A.JPG").read_bytes() == jpeg
+    assert lib.originals.is_dir() and not (lib.originals / "2024").exists()
+
+
+def test_move_never_overwrites_a_file_that_appeared_after_planning(lib, jpeg):
+    put(lib, "originals/2024/01/A.JPG", jpeg)
+    plan = plan_layout(lib, state_with(lib, jpeg, name="A.JPG", trashed=True), scan(lib))
+    put(lib, f"trash/{sha(jpeg)}/A.JPG", b"other")
+    apply_layout(lib, plan)
+    assert (lib.originals / "2024/01/A.JPG").read_bytes() == jpeg
+    assert (lib.root / f"trash/{sha(jpeg)}/A.JPG").read_bytes() == b"other"
+
+
+def test_restore_moves_file_back_and_removes_emptied_trash_folder(lib, jpeg):
+    item = sha(jpeg)
+    put(lib, f"trash/{item}/A.JPG", jpeg)
+    s = fold([imp(item, name="A.JPG"), ev("trash", item, ts=T1), ev("restore", item, ts=T2)])
+    apply_layout(lib, plan_layout(lib, s, scan(lib)))
+    assert (lib.originals / "2024/01/A.JPG").read_bytes() == jpeg
+    assert lib.trash.is_dir() and list(lib.trash.iterdir()) == []
+
+
+def test_untracked_file_is_reported_not_deleted(lib):
+    put(lib, "originals/2024/01/stray.jpg", b"x")
+    plan = plan_layout(lib, fold([]), scan(lib))
+    assert plan.untracked == ["originals/2024/01/stray.jpg"] and plan.deletes == []
+    apply_layout(lib, plan)
+    assert (lib.originals / "2024/01/stray.jpg").read_bytes() == b"x"
+
+
+def test_purged_file_is_deleted(lib, jpeg):
+    rel = f"trash/{sha(jpeg)}/A.JPG"
+    put(lib, rel, jpeg)
+    plan = plan_layout(lib, state_with(lib, jpeg, name="A.JPG", trashed=True, purged=True), scan(lib))
+    assert plan.deletes == [rel]
+    apply_layout(lib, plan)
+    assert not (lib.root / rel).exists() and list(lib.trash.iterdir()) == []
+
+
+def test_delete_rereads_a_file_replaced_with_same_size_and_mtime(lib):
+    purged, live = b"P" * 32, b"L" * 32
+    rel = f"trash/{sha(purged)}/A.JPG"
+    st = put(lib, rel, purged).stat()
+    plan = plan_layout(lib, state_with(lib, purged, name="A.JPG", purged=True), scan(lib))
+    os.utime(put(lib, rel, live), ns=(st.st_atime_ns, st.st_mtime_ns))
+    apply_layout(lib, plan)
+    assert (lib.root / rel).read_bytes() == live
+
+
+def test_purged_file_is_deleted_before_a_kept_file_moves_into_its_name(lib):
+    old, new = b"purged elsewhere", b"took the freed name"
+    s = fold([imp(sha(old), name="N.JPG", ts=T1), ev("purge", sha(old), ts=T2), imp(sha(new), name="N.JPG", ts=T3)])
+    put(lib, "originals/2024/01/N.JPG", old)
+    put(lib, f"originals/2024/01/N~{sha(new)[:8]}.JPG", new)
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.deletes == ["originals/2024/01/N.JPG"] and plan.conflicts == []
+    apply_layout(lib, plan)
+    assert [p.name for p in (lib.originals / "2024/01").iterdir()] == ["N.JPG"]
+    assert (lib.originals / "2024/01/N.JPG").read_bytes() == new
+
+
+def test_file_shared_with_a_live_item_is_never_deleted(lib):
+    clip, gone = b"clip", "f" * 64
+    paired = imp(gone, name="P.JPG", live="P.MOV")
+    paired["files"][1]["sha256"] = sha(clip)
+    s = fold([paired, ev("purge", gone, ts=T1), imp(sha(clip), name="C.MOV", ts=T2)])
+    put(lib, "originals/2024/01/C.MOV", clip)
+    assert plan_layout(lib, s, scan(lib)).summary() == CLEAN
+
+
+def test_conflicting_bytes_at_expected_path_are_kept(lib, jpeg):
+    item = sha(jpeg)
+    put(lib, "originals/2024/01/A.JPG", b"other")
+    put(lib, f"trash/{item}/A.JPG", jpeg)
+    s = fold([imp(item, name="A.JPG")])
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.conflicts == [("originals/2024/01/A.JPG", item, sha(b"other"))] and plan.moves == []
+    apply_layout(lib, plan)
+    assert (lib.originals / "2024/01/A.JPG").read_bytes() == b"other"
+    assert (lib.root / f"trash/{item}/A.JPG").read_bytes() == jpeg
+
+
+def test_name_freed_by_a_move_is_filled_in_the_same_run(lib):
+    a, b = b"imported first elsewhere", b"imported here"
+    s = fold([imp(sha(a), name="N.JPG", ts=T1), imp(sha(b), name="N.JPG", ts=T2)])
+    put(lib, "originals/2024/01/N.JPG", b)
+    put(lib, "originals/2024/02/N.JPG", a)
+    suffixed = f"originals/2024/01/N~{sha(b)[:8]}.JPG"
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.moves == [("originals/2024/01/N.JPG", suffixed), ("originals/2024/02/N.JPG", "originals/2024/01/N.JPG")]
+    assert plan.summary() == CLEAN | {"moves": 2}
+    apply_layout(lib, plan)
+    assert (lib.root / suffixed).read_bytes() == b and (lib.originals / "2024/01/N.JPG").read_bytes() == a
+    assert plan_layout(lib, s, scan(lib)).summary() == CLEAN
+
+
+def test_path_vacated_by_a_move_is_missing_not_a_conflict(lib):
+    a, b = b"imported first elsewhere", b"imported here"
+    s = fold([imp(sha(a), name="N.JPG", ts=T1), imp(sha(b), name="N.JPG", ts=T2)])
+    put(lib, "originals/2024/01/N.JPG", b)
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.missing == [(sha(a), "originals/2024/01/N.JPG")] and plan.conflicts == []
+    assert plan.summary() == CLEAN | {"moves": 1, "missing": 1}
+
+
+def test_swapped_files_are_conflicts_and_stay_put(lib):
+    a, b = b"a", b"b"
+    s = fold([imp(sha(a), name="A.JPG", ts=T1), imp(sha(b), name="B.JPG", ts=T2)])
+    put(lib, "originals/2024/01/A.JPG", b)
+    put(lib, "originals/2024/01/B.JPG", a)
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.moves == [] and plan.conflicts == [
+        ("originals/2024/01/A.JPG", sha(a), sha(b)), ("originals/2024/01/B.JPG", sha(b), sha(a))]
+    apply_layout(lib, plan)
+    assert (lib.originals / "2024/01/A.JPG").read_bytes() == b
+
+
+def test_copy_verified_leaves_no_partial_on_mismatch(tmp_path):
+    src = tmp_path / "s"
+    src.write_bytes(b"abc")
+    with pytest.raises(CopyError):
+        copy_verified(src, tmp_path / "d", "0" * 64)
+    assert not (tmp_path / "d").exists() and not (tmp_path / "d.part").exists()
+
+
+def test_copy_verified_creates_parents(tmp_path):
+    src = tmp_path / "s"
+    src.write_bytes(b"abc")
+    dst = tmp_path / "x/y/d"
+    copy_verified(src, dst, sha(b"abc"))
+    assert dst.read_bytes() == b"abc" and list(dst.parent.iterdir()) == [dst]
+
+
+def test_copy_verified_replaces_a_stale_part(tmp_path):
+    src = tmp_path / "s"
+    src.write_bytes(b"abc")
+    (tmp_path / "d.part").write_bytes(b"half of an earlier run")
+    copy_verified(src, tmp_path / "d", sha(b"abc"))
+    assert (tmp_path / "d").read_bytes() == b"abc" and not (tmp_path / "d.part").exists()
+
+
+def test_copy_verified_never_overwrites(tmp_path):
+    src = tmp_path / "s"
+    src.write_bytes(b"abc")
+    (tmp_path / "d").write_bytes(b"old")
+    with pytest.raises(CopyError):
+        copy_verified(src, tmp_path / "d", sha(b"abc"))
+    assert (tmp_path / "d").read_bytes() == b"old" and not (tmp_path / "d.part").exists()
+
+
+def test_scan_removes_stale_part_files(lib):
+    put(lib, "originals/2024/01/A.JPG.part", b"half")
+    scan(lib)
+    assert not (lib.root / "originals/2024/01/A.JPG.part").exists()
+
+
+def test_scan_covers_originals_and_trash_only_with_sorted_paths(lib):
+    for rel in ("trash/t/z", "originals/2024/02/b", "originals/2024/01/a", "sources/i/a", "cache/a", "app/a"):
+        put(lib, rel, b"same")
+    assert scan(lib) == {sha(b"same"): ["originals/2024/01/a", "originals/2024/02/b", "trash/t/z"]}
+
+
+def test_scan_skips_symlinks(lib):
+    (lib.originals / "dangling").symlink_to(lib.root / "nowhere")
+    assert scan(lib) == {}
+
+
+def test_hash_cache_rehashes_only_when_size_or_mtime_changes(lib):
+    path = put(lib, "originals/x", b"aaa")
+    with HashCache(lib) as cache:
+        assert cache.sha(path) == sha(b"aaa")
+    st = path.stat()
+    path.write_bytes(b"bbb")
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    with HashCache(lib) as cache:
+        assert cache.sha(path) == sha(b"aaa")
+        assert cache.sha(path, rehash=True) == sha(b"bbb")
+        path.write_bytes(b"cccc")
+        assert cache.sha(path) == sha(b"cccc")
+    assert (lib.cache / "files.sqlite").is_file()
