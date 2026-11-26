@@ -11,12 +11,12 @@ A library is a set of equal copies. Each copy is a folder; copies converge by ex
   originals/     YYYY/MM/<name>, or undated/<name>
   sources/       untouched imports (opaque to the app)
   log/           <copy_id>.jsonl, one change log per copy
-  trash/         trashed items, same relative names as originals/
+  trash/         <item id>/<name>: trashed items, <name> is the name the item has (or would have) in originals/
   cache/         derived data (thumbnails, hashes); safe to delete
   app/           app state; safe to delete
 ```
 
-Originals and trash files are only renamed, copied with hash verification, or deleted when their item is purged. Their bytes are never modified.
+Restore moves a file back to the same place in originals/. Originals and trash files are only renamed, copied with hash verification, or deleted when their item is purged. Their bytes are never modified.
 
 ## JSON files
 
