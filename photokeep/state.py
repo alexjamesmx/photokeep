@@ -30,7 +30,7 @@ class State:
     items: dict[str, Item] = field(default_factory=dict)
     copies: dict[str, str] = field(default_factory=dict)
     tombstones: dict[str, str] = field(default_factory=dict)
-    fingerprints: dict[tuple, str] = field(default_factory=dict)
+    fingerprints: dict[tuple, set[str]] = field(default_factory=dict)
 
     def apply(self, e: dict) -> None:
         # Events arrive in (ts, copy, id) order; every fold rule lives in this method.
@@ -72,7 +72,8 @@ class State:
 
     def _import(self, e: dict, item: Item | None) -> None:
         fingerprint = tuple(e["fingerprint"]) if e.get("fingerprint") else None
-        if self.is_blocked(e["item"], fingerprint):
+        # A known item is judged by its own state only: versions share fingerprints.
+        if item.blocked if item else self.is_blocked(e["item"], fingerprint):
             return
         if item and item.status == "live":
             item.imports.append(e["import"])
@@ -83,7 +84,7 @@ class State:
             fresh.favorite, fresh.hidden, fresh.albums = item.favorite, item.hidden, item.albums
         self.items[e["item"]] = fresh
         if fingerprint:
-            self.fingerprints[fingerprint] = e["item"]
+            self.fingerprints.setdefault(fingerprint, set()).add(e["item"])
 
     def live(self) -> list[Item]:
         return [i for i in self.items.values() if i.status == "live"]
@@ -91,8 +92,7 @@ class State:
     def is_blocked(self, sha: str, fingerprint: tuple | None = None) -> bool:
         if sha in self.tombstones or (sha in self.items and self.items[sha].blocked):
             return True
-        twin = self.items.get(self.fingerprints.get(fingerprint)) if fingerprint else None
-        return bool(twin and twin.blocked)
+        return any(self.items[i].blocked for i in self.fingerprints.get(fingerprint, ()))
 
     def due_purges(self, now: datetime, days: int = TRASH_DAYS) -> list[str]:
         cutoff = ts_str(now - timedelta(days=days))

@@ -111,3 +111,32 @@ def test_due_purges_after_30_days():
               ev("trash", "b", ts="2026-01-01T00:00:00.000000Z")])
     assert s.due_purges(datetime(2026, 1, 31, tzinfo=UTC)) == ["a", "b"]
     assert s.due_purges(datetime(2026, 1, 30, tzinfo=UTC)) == []
+
+
+def test_shared_fingerprint_stays_blocked_while_any_holder_is_blocked():
+    s = fold([imp("a", fingerprint=FP), imp("b", ts=T1, fingerprint=FP), ev("trash", "a", ts=T2),
+              imp("c", ts=T3, fingerprint=FP)])
+    assert s.is_blocked("x", tuple(FP)) and "c" not in s.items
+
+
+def test_repeat_import_of_live_version_survives_trashed_twin():
+    s = fold([imp("a", fingerprint=FP), imp("b", ts=T1, fingerprint=FP), ev("trash", "a", ts=T2),
+              imp("b", ts=T3, fingerprint=FP)])
+    assert len(s.items["b"].imports) == 2
+
+
+def test_trash_after_purge_stays_purged():
+    s = fold([imp("a"), ev("purge", "a", ts=T1), ev("trash", "a", ts=T2)])
+    assert s.items["a"].status == "purged" and s.items["a"].trashed_at is None
+
+
+def test_trash_of_unknown_item_changes_nothing():
+    s = fold([ev("purge", "z", ts=T1, name="n"), ev("trash", "z", ts=T2), ev("trash", "y", ts=T2)])
+    assert s.items == {} and s.tombstones == {"z": "n"}
+
+
+def test_purged_and_restored_items_are_not_due():
+    old = "2026-01-01T00:00:00.000000Z"
+    s = fold([imp("a"), imp("b"), ev("trash", "a", ts=old), ev("purge", "a", ts=T1),
+              ev("trash", "b", ts=old), ev("restore", "b", ts=T1)])
+    assert s.due_purges(datetime(2027, 1, 1, tzinfo=UTC)) == []
