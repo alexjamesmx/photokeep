@@ -33,7 +33,7 @@ Timestamps are UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Both files are written atomic
 
 ## Change log
 
-One file per copy, append-only. A line is one JSON object plus `\n`. Readers ignore a torn last line (no trailing newline); a bad line elsewhere is corruption. Unknown ops are kept when reading and ignored when folding.
+One file per copy, append-only. A line is one JSON object plus `\n`. Readers ignore a torn last line (no trailing newline) and the next append cuts it off; a bad line elsewhere is corruption. Unknown ops are kept when reading and ignored when folding.
 
 Common keys: `v` (1), `id` (uuid4 hex), `ts` (UTC, as above), `copy` (author's copy id), `op`, then op fields. Events are ordered by `(ts, copy, id)`. The item id is the lowercase hex SHA-256 of the main file.
 

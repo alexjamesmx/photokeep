@@ -2,8 +2,9 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
+
+from photokeep import events
 
 FORMAT_VERSION = 1
 SUBDIRS = ("originals", "sources", "log", "trash", "cache", "app")
@@ -48,10 +49,6 @@ class Library:
         return self.log_dir / f"{copy_id or self.copy_id}.jsonl"
 
 
-def _now() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
-
-
 def _write_json(path: Path, data: dict) -> None:
     # Temp file + rename so a crash never leaves a half-written file.
     tmp = path.with_name(f".{path.name}.tmp")
@@ -73,11 +70,13 @@ def _prepare(root: Path) -> None:
 
 def _create(root: Path, name: str, library_id: str, created: str | None = None) -> Library:
     _prepare(root)
-    now = _now()
+    now = events.utcnow()
     copy_id = uuid.uuid4().hex
     _write_json(root / "library.json", {"format": FORMAT_VERSION, "library_id": library_id, "created": created or now})
     _write_json(root / "copy.json", {"copy_id": copy_id, "name": name, "created": now})
-    return Library(root, library_id, copy_id, name)
+    lib = Library(root, library_id, copy_id, name)
+    events.append(lib, [events.new_event(lib, "copy.name", ts=now, name=name)])
+    return lib
 
 
 def init_library(root: Path, name: str) -> Library:
