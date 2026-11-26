@@ -25,8 +25,12 @@ class LogCorrupt(Exception):
     pass
 
 
+def ts_str(moment: datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
 def utcnow() -> str:
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    return ts_str(datetime.now(UTC))
 
 
 def new_event(lib: "Library", op: str, *, ts: str | None = None, **fields) -> dict:
