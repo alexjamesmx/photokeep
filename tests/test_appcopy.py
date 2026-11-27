@@ -1,3 +1,4 @@
+import json
 import os
 import stat
 import subprocess
@@ -7,6 +8,7 @@ from pathlib import Path
 import photokeep
 from photokeep.appcopy import install
 from photokeep.cli import main
+from photokeep.library import locked
 from tests.helpers import put
 
 PACKAGE = Path(photokeep.__file__).parent
@@ -67,3 +69,20 @@ def test_cli_init_installs_the_app(tmp_path):
     assert main(["init", str(tmp_path / "B"), "--name", "hdd", "--copy-of", str(tmp_path / "A")]) == 0
     for root in (tmp_path / "A", tmp_path / "B"):
         assert (root / "app/photokeep/__init__.py").is_file() and (root / "Open Photos.bat").is_file()
+
+
+def test_cli_app_install_replaces_a_copys_app_with_this_one(lib, capsys):
+    put(lib, "app/photokeep/__init__.py", b'__version__ = "0.0.1"\n')
+    (lib.root / "Open Photos.sh").unlink(missing_ok=True)
+    assert main(["app", "install", str(lib.root), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"root": str(lib.root), "version": photokeep.__version__}
+    assert (lib.app / "photokeep/__init__.py").read_bytes() == (PACKAGE / "__init__.py").read_bytes()
+    assert (lib.root / "Open Photos.sh").read_text() == SH
+
+
+def test_cli_app_install_waits_for_a_busy_copy(lib, capsys):
+    put(lib, "app/photokeep/__init__.py", b'__version__ = "0.0.1"\n')
+    with locked(lib):
+        assert main(["app", "install", str(lib.root)]) == 1
+    assert "busy" in capsys.readouterr().err
+    assert (lib.app / "photokeep/__init__.py").read_bytes() == b'__version__ = "0.0.1"\n'

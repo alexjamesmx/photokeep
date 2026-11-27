@@ -36,6 +36,7 @@ Run as `uv run photokeep ...`, or `python3 -m photokeep ...` with `PYTHONPATH=ap
 - `photokeep repair <copy> --from <copy> [--dry-run]` restores missing and corrupt files from another copy's verified bytes. A corrupt file moves to `quarantine/` only once its replacement is ready. Exit 2 when some stay bad.
 - `photokeep cache refresh <copy> [--no-render]` rebuilds the viewer index and renders missing thumbnails. Cache is always rebuildable.
 - `photokeep serve <copy> [--port N] [--no-browser]` runs the viewer until Ctrl+C. It records trash, restore, delete and favorite as events.
+- `photokeep app install <copy>` puts the running Photokeep in the copy's `app/` and refreshes its launchers. Sync then carries it to copies with an older app (see update-app).
 - `photokeep migrate-v0 <old> <copy> --raw <dir> --zip <file>... [--dry-run]` fills a new copy from the prototype library, once. It copies; the prototype is never changed.
 
 ## Runbooks
@@ -52,7 +53,7 @@ Design: [docs/architecture.md](docs/architecture.md). Decisions: [docs/decisions
 
 ## Development
 
-`uv sync`, then `uv run pytest -q` and `uv run mypy photokeep`; CI runs both. The suite builds synthetic fixtures; there are no real photos. Core modules use only the standard library; `media.py` imports Pillow and numpy lazily (extra `media`).
+`uv sync`, then `uv run pytest -q` and `uv run mypy photokeep`; CI runs both. Any change under `photokeep/` bumps `__version__` in `photokeep/__init__.py` (the patch number at least), the only place the version lives: sync moves an `app/` only onto a lower version, so an unbumped change never reaches the copies. The suite builds synthetic fixtures; there are no real photos. Core modules use only the standard library; `media.py` imports Pillow and numpy lazily (extra `media`).
 
 Module map (`photokeep/`):
 

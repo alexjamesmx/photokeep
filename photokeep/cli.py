@@ -12,7 +12,7 @@ from photokeep import __version__, appcopy, media, migrate_v0, server, status, s
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
-from photokeep.library import LibraryError, init_copy, init_library, open_library
+from photokeep.library import LibraryError, init_copy, init_library, locked, open_library
 
 # Subcommand handlers by name; build_parser gives each its subparser, with the docstring as help.
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
@@ -274,6 +274,26 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _app_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("action", choices=["install"])
+    _copy_arg(p)
+
+
+def cmd_app(args: argparse.Namespace) -> int:
+    """Put this Photokeep in a copy's app/ and refresh its launchers (`app install`)."""
+    try:
+        lib = open_library(args.copy)
+        with locked(lib):
+            appcopy.restore(lib)  # finish an app swap that was cut off first
+            appcopy.install(lib)
+    except (LibraryError, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps({"root": str(lib.root), "version": __version__}) if args.json
+          else f"app {__version__} installed in {lib.app}")
+    return 0
+
+
 def _migrate_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("old", type=Path, help="the prototype library (the folder holding .library/)")
     _copy_arg(p)
@@ -314,6 +334,7 @@ COMMANDS["repair"], ARGUMENTS["repair"] = cmd_repair, _repair_args
 COMMANDS["status"], ARGUMENTS["status"] = cmd_status, _copy_arg
 COMMANDS["cache"], ARGUMENTS["cache"] = cmd_cache, _cache_args
 COMMANDS["serve"], ARGUMENTS["serve"] = cmd_serve, _serve_args
+COMMANDS["app"], ARGUMENTS["app"] = cmd_app, _app_args
 COMMANDS["migrate-v0"], ARGUMENTS["migrate-v0"] = cmd_migrate_v0, _migrate_args
 
 

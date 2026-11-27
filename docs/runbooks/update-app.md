@@ -2,6 +2,12 @@
 
 Each copy carries its own `app/`. Sync can move the newer one onto the older, so a drive that was offline for a while gets the new viewer. Only run this when the owner asks, or when `app.direction` in a sync plan is not null.
 
+To put a newer Photokeep (this checkout, after an update) into a copy first, with the owner's go-ahead:
+```
+photokeep app install <copy> --json
+```
+Success: exit 0 and the new `version`. Exit 1 with "busy" means a sync or the viewer holds the copy: stop the viewer, then run it again. Then follow the steps below to carry it to the other copies.
+
 1. Check the versions with the sync plan (this changes nothing):
    ```
    photokeep sync <copy-a> <copy-b> --update-app --json
