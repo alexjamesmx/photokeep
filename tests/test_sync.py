@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from photokeep import events, fsops, hashcache
+from photokeep import sync as sync_module
 from photokeep.cache import Cache
 from photokeep.cli import main
 from photokeep.events import LogCorrupt, append_lines, read_all, read_log, ts_str
@@ -470,4 +471,70 @@ def test_sources_conflict_prints_and_exits_2(a, b, capsys):
     assert main(["sync", str(a.root), str(b.root), "--json"]) == 2
     assert json.loads(capsys.readouterr().out)["sources"]["conflicts"] == [f"{IMPORT}/exif.json"]
     assert main(["sync", str(a.root), str(b.root)]) == 2
-    assert f"sources: 0 a->b, 0 b->a, conflicts: 1 ({IMPORT}/exif.json)" in capsys.readouterr().out
+    assert f"sources: 0 a->b, 0 b->a, sources conflicts: 1 ({IMPORT}/exif.json)" in capsys.readouterr().out
+
+
+def test_symlinked_subfolder_on_b_is_never_written_through(a, b, tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    put(a, f"sources/{IMPORT}/sub/file.txt", b"real")
+    (b.sources / IMPORT).mkdir()
+    (b.sources / IMPORT / "sub").symlink_to(outside)
+    s = run(a, b, NOW).summary()
+    assert s["sources"]["conflicts"] == [f"{IMPORT}/sub", f"{IMPORT}/sub/file.txt"]
+    assert list(outside.iterdir()) == []
+
+
+def test_link_that_appears_after_planning_is_refused(a, b, tmp_path, monkeypatch):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    put(a, f"sources/{IMPORT}/sub/file.txt", b"real")
+    (b.sources / IMPORT).mkdir()
+    real = sync_module._compare_sources
+
+    def compare_then_link(x, y):
+        found = real(x, y)
+        (b.sources / IMPORT / "sub").symlink_to(outside)
+        return found
+
+    monkeypatch.setattr(sync_module, "_compare_sources", compare_then_link)
+    assert run(a, b, NOW).summary()["sources"] == {"a_to_b": 0, "b_to_a": 0, "conflicts": [f"{IMPORT}/sub/file.txt"]}
+    assert list(outside.iterdir()) == []
+
+
+def test_file_against_folder_of_the_same_name_is_a_conflict(a, b, capsys):
+    put(a, f"sources/{IMPORT}/part1", b"file")
+    put(b, f"sources/{IMPORT}/part1/Photo Details.csv", b"in a folder")
+    assert main(["sync", str(a.root), str(b.root), "--yes"]) == 2
+    out = capsys.readouterr().out
+    assert f"sources conflicts: 2 ({IMPORT}/part1, {IMPORT}/part1/Photo Details.csv)" in out
+    assert sources_of(a) == {f"{IMPORT}/part1": b"file"}
+
+
+def test_unwritable_source_name_is_reported_and_the_rest_synced(a, b, monkeypatch):
+    add_item(a, b"photo", name="A.JPG")
+    put(a, f"sources/{IMPORT}/odd.txt", b"x")
+    put(a, f"sources/{IMPORT}/fine.txt", b"y")
+    real = fsops.copy_verified
+
+    def copy(src, dst, digest):
+        if dst.name == "odd.txt":
+            raise OSError("invalid name")
+        real(src, dst, digest)
+
+    monkeypatch.setattr(fsops, "copy_verified", copy)
+    s = run(a, b, NOW).summary()
+    assert s["sources"] == {"a_to_b": 1, "b_to_a": 0, "conflicts": [f"{IMPORT}/odd.txt: invalid name"]}
+    assert files_of(b) == {"originals/2024/01/A.JPG": b"photo"} and sources_of(b) == {f"{IMPORT}/fine.txt": b"y"}
+
+
+def test_source_with_wrong_bytes_goes_to_bad_sources(a, b, monkeypatch):
+    put(a, f"sources/{IMPORT}/exif.json", b"[]")
+
+    def copy(src, dst, digest):
+        raise fsops.HashMismatch("rotted")
+
+    monkeypatch.setattr(fsops, "copy_verified", copy)
+    s = run(a, b, NOW).summary()
+    assert s["bad_sources"] == [{"side": "a", "path": f"sources/{IMPORT}/exif.json", "sha": sha(b"[]")}]
+    assert sources_of(b) == {}

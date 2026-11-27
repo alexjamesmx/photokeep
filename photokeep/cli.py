@@ -87,7 +87,7 @@ def _sync_text(s: dict, dry_run: bool, update_app: bool) -> str:
         f"layout a: {_counts(s['layout_a'])}",
         f"layout b: {_counts(s['layout_b'])}",
         f"sources: {s['sources']['a_to_b']} a->b, {s['sources']['b_to_a']} b->a, "
-        f"conflicts: {_some(s['sources']['conflicts'])}",
+        f"sources conflicts: {_some(s['sources']['conflicts'])}",
         f"missing on both: {s['missing_both']}",
         f"bad sources: {_some(bad)}",
         _app_text(s["app"], dry_run, update_app),
@@ -114,8 +114,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     summary = result.summary()
     print(json.dumps(summary) if args.json else _sync_text(summary, not args.yes, args.update_app))
     # Exit 2: sync finished, but the copies could not be made whole and the owner has to look.
-    problems = summary["conflicts"] or summary["missing_both"] or summary["bad_sources"] or summary["sources"]["conflicts"]
-    return 2 if problems else 0
+    problems = (summary["conflicts"], summary["missing_both"], summary["bad_sources"], summary["sources"]["conflicts"])
+    return 2 if any(problems) else 0
 
 
 COMMANDS["sync"] = cmd_sync
