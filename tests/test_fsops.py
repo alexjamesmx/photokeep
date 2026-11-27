@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from photokeep.fsops import CopyError, apply_layout, copy_verified, plan_layout, scan
+from photokeep.fsops import CopyError, LayoutPlan, apply_layout, copy_verified, plan_layout, scan
 from photokeep.hashcache import HashCache
 from photokeep.state import fold
 from tests.helpers import T1, T2, T3, ev, imp, put, sha, state_with
@@ -43,6 +43,16 @@ def test_untracked_file_is_reported_not_deleted(lib):
     assert plan.untracked == ["originals/2024/01/stray.jpg"] and plan.deletes == []
     apply_layout(lib, plan)
     assert (lib.originals / "2024/01/stray.jpg").read_bytes() == b"x"
+
+
+def test_tombstoned_file_is_untracked_and_never_deleted(lib):
+    rel = "originals/2024/01/T.JPG"
+    put(lib, rel, b"purged on a copy that never saw its import")
+    s = fold([ev("purge", sha(b"purged on a copy that never saw its import"), name="T.JPG")])
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.untracked == [rel] and plan.deletes == []
+    apply_layout(lib, plan)
+    assert (lib.root / rel).exists()
 
 
 def test_purged_file_is_deleted(lib, jpeg):
@@ -132,12 +142,34 @@ def test_swapped_files_are_conflicts_and_stay_put(lib):
     assert (lib.originals / "2024/01/A.JPG").read_bytes() == b
 
 
+def test_import_with_traversal_folder_places_and_moves_nothing(lib, jpeg):
+    put(lib, "originals/2024/01/A.JPG", jpeg)
+    s = fold([imp(sha(jpeg), name="A.JPG", folder="../../x")])
+    plan = plan_layout(lib, s, scan(lib))
+    assert plan.moves == [] and plan.missing == [] and plan.deletes == []
+    apply_layout(lib, plan)
+    assert (lib.originals / "2024/01/A.JPG").read_bytes() == jpeg and not (lib.root.parent / "x").exists()
+
+
+def test_plan_paths_outside_the_library_are_not_applied(lib, jpeg):
+    put(lib, "originals/2024/01/A.JPG", jpeg)
+    victim = lib.root.parent / "victim"
+    victim.write_bytes(b"v")
+    plan = LayoutPlan(moves=[("originals/2024/01/A.JPG", "../outside/A.JPG"), ("../victim", "originals/v")],
+                      deletes=["../victim", "library.json"], missing=[], untracked=[], conflicts=[],
+                      delete_shas={"../victim": sha(b"v"), "library.json": sha((lib.root / "library.json").read_bytes())})
+    apply_layout(lib, plan)
+    assert (lib.originals / "2024/01/A.JPG").read_bytes() == jpeg and not (lib.root.parent / "outside").exists()
+    assert victim.read_bytes() == b"v" and (lib.root / "library.json").exists()
+    assert not (lib.originals / "v").exists()
+
+
 def test_copy_verified_leaves_no_partial_on_mismatch(tmp_path):
     src = tmp_path / "s"
     src.write_bytes(b"abc")
     with pytest.raises(CopyError):
         copy_verified(src, tmp_path / "d", "0" * 64)
-    assert not (tmp_path / "d").exists() and not (tmp_path / "d.part").exists()
+    assert not (tmp_path / "d").exists() and not (tmp_path / "d.photokeep-part").exists()
 
 
 def test_copy_verified_creates_parents(tmp_path):
@@ -151,9 +183,9 @@ def test_copy_verified_creates_parents(tmp_path):
 def test_copy_verified_replaces_a_stale_part(tmp_path):
     src = tmp_path / "s"
     src.write_bytes(b"abc")
-    (tmp_path / "d.part").write_bytes(b"half of an earlier run")
+    (tmp_path / "d.photokeep-part").write_bytes(b"half of an earlier run")
     copy_verified(src, tmp_path / "d", sha(b"abc"))
-    assert (tmp_path / "d").read_bytes() == b"abc" and not (tmp_path / "d.part").exists()
+    assert (tmp_path / "d").read_bytes() == b"abc" and not (tmp_path / "d.photokeep-part").exists()
 
 
 def test_copy_verified_never_overwrites(tmp_path):
@@ -162,13 +194,40 @@ def test_copy_verified_never_overwrites(tmp_path):
     (tmp_path / "d").write_bytes(b"old")
     with pytest.raises(CopyError):
         copy_verified(src, tmp_path / "d", sha(b"abc"))
-    assert (tmp_path / "d").read_bytes() == b"old" and not (tmp_path / "d.part").exists()
+    assert (tmp_path / "d").read_bytes() == b"old" and not (tmp_path / "d.photokeep-part").exists()
 
 
 def test_scan_removes_stale_part_files(lib):
-    put(lib, "originals/2024/01/A.JPG.part", b"half")
-    scan(lib)
-    assert not (lib.root / "originals/2024/01/A.JPG.part").exists()
+    put(lib, "originals/2024/01/A.JPG.photokeep-part", b"half")
+    assert scan(lib) == {}
+    assert not (lib.root / "originals/2024/01/A.JPG.photokeep-part").exists()
+
+
+def test_scan_without_cleanup_keeps_part_files(lib):
+    put(lib, "originals/2024/01/A.JPG.photokeep-part", b"half")
+    assert scan(lib, cleanup=False) == {}
+    assert (lib.root / "originals/2024/01/A.JPG.photokeep-part").read_bytes() == b"half"
+
+
+def test_original_named_like_a_partial_survives_scan_and_copy(lib, jpeg):
+    real = put(lib, "originals/2024/01/A.JPG.part", b"a real file")
+    src = put(lib, "sources/A.JPG", jpeg)
+    copy_verified(src, lib.originals / "2024/01/A.JPG", sha(jpeg))
+    assert scan(lib)[sha(b"a real file")] == ["originals/2024/01/A.JPG.part"]
+    assert real.read_bytes() == b"a real file"
+
+
+def test_file_vanishing_mid_scan_is_skipped(lib, monkeypatch):
+    gone = put(lib, "originals/2024/01/a", b"a")
+    put(lib, "originals/2024/01/b", b"b")
+    real_sha = HashCache.sha
+
+    def vanish_first(cache, path, rehash=False):
+        gone.unlink(missing_ok=True)
+        return real_sha(cache, path, rehash)
+
+    monkeypatch.setattr(HashCache, "sha", vanish_first)
+    assert scan(lib) == {sha(b"b"): ["originals/2024/01/b"]}
 
 
 def test_scan_covers_originals_and_trash_only_with_sorted_paths(lib):

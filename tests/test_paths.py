@@ -1,6 +1,6 @@
 import unicodedata
 
-from photokeep.paths import assign, safe_name
+from photokeep.paths import assign, safe_name, valid_folder, valid_id
 from photokeep.state import fold
 from tests.helpers import T1, T2, T3, ev, imp
 
@@ -67,3 +67,23 @@ def test_suffixed_name_that_is_taken_falls_back_to_full_id():
     p = assign(s)
     assert p[B]["main"] == f"originals/2024/01/x~{B}.jpg"
     assert len({v["main"].casefold() for v in p.values()}) == 3
+
+
+def test_safe_name_never_ends_in_the_partial_suffix():
+    assert safe_name("A.JPG.photokeep-part") == "A.JPG.photokeep-part_"
+    assert safe_name("A.JPG.PhotoKeep-Part.") == "A.JPG.PhotoKeep-Part_"
+    assert safe_name("A.JPG.part") == "A.JPG.part"
+
+
+def test_valid_folder_and_id():
+    assert valid_folder("2024/01") and valid_folder("undated")
+    for bad in ("../../x", "2024/1", "2024/01/..", "/2024/01", "２０２４/01", "2024/01\n", "", None, 2024):
+        assert not valid_folder(bad), bad
+    assert valid_id(A)
+    for bad in ("A" * 64, "a" * 63, "../" + "a" * 61, "g" * 64, None):
+        assert not valid_id(bad), bad
+
+
+def test_assign_skips_items_with_unsafe_folder_or_id():
+    s = fold([imp(A, folder="../../x", ts=T1), imp("../../etc/" + "a" * 54, ts=T2), imp(B, ts=T3)])
+    assert list(assign(s)) == [B]

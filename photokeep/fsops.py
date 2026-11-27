@@ -6,11 +6,12 @@ from pathlib import Path
 
 from photokeep.hashcache import HashCache
 from photokeep.library import Library
-from photokeep.paths import assign
+from photokeep.paths import PART, assign
 from photokeep.state import State
 
-PART = ".part"
 _CHUNK = 1 << 20
+# Exclusive create never follows a symlink planted at the temp path; O_BINARY stops Windows newline translation.
+_NEW_FILE = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
 
 
 class CopyError(Exception):
@@ -27,9 +28,11 @@ def copy_verified(src: Path, dst: Path, sha: str) -> None:
     _refuse_existing(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + PART)
-    digest = hashlib.sha256()
+    part.unlink(missing_ok=True)  # left by an interrupted run; safe_name keeps originals off this name
+    fd = os.open(part, _NEW_FILE, 0o666)
     try:
-        with open(src, "rb") as fin, open(part, "wb") as fout:
+        digest = hashlib.sha256()
+        with os.fdopen(fd, "wb") as fout, open(src, "rb") as fin:
             while chunk := fin.read(_CHUNK):
                 digest.update(chunk)
                 fout.write(chunk)
@@ -53,17 +56,27 @@ def _files(folder: Path) -> Iterator[Path]:
                 yield Path(e.path)
 
 
-def scan(lib: Library, rehash: bool = False) -> dict[str, list[str]]:
-    """Map the SHA-256 of every file under originals/ and trash/ to its sorted relative paths."""
+def _hash(cache: HashCache, path: Path, rehash: bool = False) -> str | None:
+    try:
+        return cache.sha(path, rehash)
+    except FileNotFoundError:
+        return None  # removed by another process since the walk
+
+
+def scan(lib: Library, rehash: bool = False, cleanup: bool = True) -> dict[str, list[str]]:
+    """Map the SHA-256 of every file under originals/ and trash/ to its sorted relative paths.
+
+    Leftover copy_verified temp files are never reported; `cleanup` deletes them.
+    """
     rels = sorted(p.relative_to(lib.root).as_posix() for top in (lib.originals, lib.trash) for p in _files(top))
     found: dict[str, list[str]] = {}
     with HashCache(lib) as cache:
         for rel in rels:
             if rel.endswith(PART):
-                # copy_verified's temp suffix: an interrupted copy, never a finished file.
-                (lib.root / rel).unlink()
-                continue
-            found.setdefault(cache.sha(lib.root / rel, rehash), []).append(rel)
+                if cleanup:
+                    (lib.root / rel).unlink(missing_ok=True)
+            elif digest := _hash(cache, lib.root / rel, rehash):
+                found.setdefault(digest, []).append(rel)
     return found
 
 
@@ -92,10 +105,10 @@ def _expected(state: State) -> list[tuple[str, str]]:
 def plan_layout(lib: Library, state: State, found: dict[str, list[str]]) -> LayoutPlan:
     """Plan the moves and deletes that make `found` match the folded state, without touching disk."""
     kept = {f["sha256"] for i in state.items.values() if i.status != "purged" for f in i.files}
-    gone = {f["sha256"] for i in state.items.values() if i.status == "purged" for f in i.files}
-    gone |= set(state.tombstones)
-    # A file of a live or trashed item is never deleted, even if a purged item shares its bytes.
-    erasable, known = gone - kept, kept | gone
+    purged = {f["sha256"] for i in state.items.values() if i.status == "purged" for f in i.files}
+    # Only a purged item's own files are erased, never bytes a live or trashed item shares. A tombstone
+    # has no import event here, so its bytes count as untracked and stay (spec 6.5).
+    erasable, known = purged - kept, kept | purged
     at = {p: s for s, ps in found.items() for p in ps}
     deletes = sorted(p for p, s in at.items() if s in erasable)
     untracked = sorted(p for p, s in at.items() if s not in known)
@@ -145,17 +158,23 @@ def _remove_empty_folders(top: Path) -> None:
 
 def apply_layout(lib: Library, plan: LayoutPlan) -> None:
     """Carry out a plan; a step whose file changed since planning is skipped, never forced."""
+    # Plan paths derive from other copies' logs: act only inside originals/ and trash/.
+    tops = [lib.originals.resolve(), lib.trash.resolve()]
+
+    def inside(path: Path) -> bool:
+        return any(path.resolve().is_relative_to(top) for top in tops)
+
     with HashCache(lib) as cache:
         # Deletes first: a purged file may sit where a kept file has to move.
         for rel in plan.deletes:
-            path = lib.root / rel
+            path, want = lib.root / rel, plan.delete_shas.get(rel)
             # The cache trusts size and mtime; re-read so a replaced file is never deleted.
-            if path.is_file() and cache.sha(path, rehash=True) == plan.delete_shas.get(rel):
-                path.unlink()
+            if want and inside(path) and path.is_file() and _hash(cache, path, rehash=True) == want:
+                path.unlink(missing_ok=True)
                 cache.forget(path)
         for src, dst in plan.moves:
             source, target = lib.root / src, lib.root / dst
-            if source.is_file() and not os.path.lexists(target):
+            if inside(source) and inside(target) and source.is_file() and not os.path.lexists(target):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source, target)
                 cache.move(source, target)
