@@ -229,8 +229,7 @@ def _serve_args(p: argparse.ArgumentParser) -> None:
 def cmd_serve(args: argparse.Namespace) -> int:
     """Open the viewer for a copy (runs until Ctrl+C)."""
     try:
-        # absolute: the launchers pass ".", and the page shows the root and hands paths to other apps
-        lib = open_library(args.copy.absolute())
+        lib = open_library(args.copy)
         srv = server.make_server(lib, args.port)
     except (LibraryError, LogCorrupt, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)

@@ -295,3 +295,11 @@ def test_cli_text_lists_problems_and_exits_2(tmp_path, lib, capsys):
     assert code == 2
     assert "items: 3" in out and f"problems: 1 (row {gone} (Undated/IMG_0006.JPG): file missing" in out
     assert "dry run: nothing changed" in out
+
+
+def test_cli_with_relative_paths(tmp_path, lib, monkeypatch):
+    v = make_v0(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    rel = [str(p.relative_to(tmp_path)) for p in (v.root, lib.root, v.raw, v.zip)]
+    assert main(["migrate-v0", rel[0], rel[1], "--raw", rel[2], "--zip", rel[3]]) == 0
+    assert main(["verify", rel[1]]) == 0

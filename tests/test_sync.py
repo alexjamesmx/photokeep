@@ -563,3 +563,10 @@ def test_logs_left_unequal_by_the_exchange_stop_the_sync(a, b, monkeypatch):
     with pytest.raises(LogCorrupt, match="still differ"):
         run(a, b, TRASHED + timedelta(days=31))
     assert snapshot(a, b) == before
+
+
+def test_cli_sync_with_relative_paths(a, b, monkeypatch):
+    add_item(a, b"photo", name="A.JPG")
+    monkeypatch.chdir(a.root.parent)
+    assert main(["sync", "A", "B", "--yes"]) == 0
+    assert files_of(b) == files_of(a) == {"originals/2024/01/A.JPG": b"photo"}

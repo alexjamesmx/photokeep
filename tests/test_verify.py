@@ -133,3 +133,12 @@ def test_cli_verify_and_repair(a, b, capsys):
 def test_cli_errors_exit_1(tmp_path, capsys):
     assert main(["verify", str(tmp_path / "nope")]) == 1
     assert "photokeep:" in capsys.readouterr().err
+
+
+def test_cli_verify_and_repair_with_relative_paths(a, b, monkeypatch):
+    synced(a, b)
+    (a.root / MAIN).unlink()
+    monkeypatch.chdir(a.root.parent)
+    assert main(["verify", "B"]) == 0
+    assert main(["repair", "A", "--from", "B"]) == 0
+    assert main(["verify", "A"]) == 0 and files_of(a) == files_of(b)

@@ -20,7 +20,7 @@ Phones are planned (as a source of new photos, and as a consumer filled newest-f
 
 ## How copies are recognized
 
-By `copy.json` (`copy_id`) and `library.json` (`library_id`) at the copy's root, never by mount path. A drive can mount anywhere. To find copies, look for folders that hold both files, then run `photokeep status <path>`. Pass absolute paths to every command: a relative path to a copy currently makes `verify`, `repair` and `sync` report files as missing.
+By `copy.json` (`copy_id`) and `library.json` (`library_id`) at the copy's root, never by mount path. A drive can mount anywhere. To find copies, look for folders that hold both files, then run `photokeep status <path>`.
 
 Layout and event format: [docs/library-format.md](docs/library-format.md).
 

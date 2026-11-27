@@ -96,6 +96,13 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _absolute(root: Path) -> Path:
+    # Every path in a copy is built from its root, and some are joined to it twice (cache keys) or shown
+    # to the owner, so a relative root would break the moment it is used. Not resolved: a copy reached
+    # through a symlinked mount point keeps the path it was given.
+    return Path(root).absolute()
+
+
 def _prepare(root: Path) -> None:
     if root.exists() and (not root.is_dir() or any(root.iterdir())):
         raise LibraryError(f"{root} is not empty")
@@ -106,6 +113,7 @@ def _prepare(root: Path) -> None:
 
 
 def _create(root: Path, name: str, library_id: str, created: str | None = None) -> Library:
+    root = _absolute(root)
     _prepare(root)
     now = events.utcnow()
     copy_id = uuid.uuid4().hex
@@ -135,6 +143,7 @@ def _read_json(path: Path) -> dict:
 
 
 def open_library(root: Path) -> Library:
+    root = _absolute(root)
     info = _read_json(root / "library.json")
     if info.get("format", 0) > FORMAT_VERSION:
         raise LibraryError(

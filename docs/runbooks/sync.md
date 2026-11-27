@@ -1,6 +1,6 @@
 # Sync two copies
 
-Use when the owner asks to sync, back up or bring two copies level. Both copies must be mounted. Use absolute paths, and find copies by `copy.json`, never by mount path.
+Use when the owner asks to sync, back up or bring two copies level. Both copies must be mounted. Find copies by `copy.json`, never by mount path.
 
 1. Check both copies open and belong to the same library:
    ```

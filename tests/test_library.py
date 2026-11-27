@@ -2,6 +2,7 @@ import errno
 import json
 import os
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -151,3 +152,10 @@ def test_lock_passes_on_other_errors(lib, monkeypatch):
     monkeypatch.setattr(fcntl, "flock", broken)
     with pytest.raises(OSError), locked(lib):
         pass
+
+
+def test_roots_are_absolute_whatever_path_is_given(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    made = init_library(Path("L"), "laptop")
+    copy = init_copy(Path("M"), "drive", of=open_library(Path("L")))
+    assert made.root == tmp_path / "L" == open_library(Path("L")).root and copy.root == tmp_path / "M"
