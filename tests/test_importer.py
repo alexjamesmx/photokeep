@@ -10,15 +10,15 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from photokeep import events, importer, staging, sync
+from photokeep import events, fsops, importer, staging, sync
 from photokeep.cache import Cache
 from photokeep.events import read_all
 from photokeep.importer import Candidate, ImportFailed, SourceFile
 from photokeep.library import init_library
-from photokeep.metadata import provider_record
+from photokeep.metadata import derive, fingerprint, provider_record
 from photokeep.state import fold
 from photokeep.verify import verify
-from tests.helpers import T1, add_item, ev, exif_jpeg, imp, jpeg_bytes, sha, snapshot
+from tests.helpers import T1, add_item, ev, exif_jpeg, files_of, imp, jpeg_bytes, put, sha, snapshot
 
 needs_exiftool = pytest.mark.skipif(shutil.which("exiftool") is None, reason="exiftool is not installed")
 IMPORT_ID = re.compile(r"\d{4}-\d\d-\d\d-test-[0-9a-f]{6}")
@@ -35,8 +35,18 @@ def unplugged() -> io.BytesIO:
     raise OSError("source unplugged")
 
 
-def run(lib, *cands: Candidate, sources: tuple[SourceFile, ...] = (), dry_run: bool = False) -> dict:
-    return importer.run(lib, "test", list(cands), list(sources), dry_run, datetime.now(UTC))
+def run(lib, *cands: Candidate, sources: tuple[SourceFile, ...] = (), dry_run: bool = False,
+        roots: tuple[Path, ...] = ()) -> dict:
+    return importer.run(lib, "test", list(cands), list(sources), dry_run, datetime.now(UTC), roots=roots)
+
+
+def held(lib, photo: bytes, clip: bytes | None = None) -> None:
+    """photo as an earlier import left it in lib, with its Live clip."""
+    put(lib, "originals/2024/01/IMG_1.JPG", photo)
+    if clip:
+        put(lib, "originals/2024/01/IMG_1.MOV", clip)
+    events.append(lib, [imp(sha(photo), copy=lib.copy_id, size=len(photo), live="IMG_1.MOV" if clip else None,
+                            live_sha=sha(clip) if clip else None)])
 
 
 def staged(lib) -> list[str]:
@@ -96,17 +106,38 @@ def test_provider_date_files_a_photo_without_one(lib):
 
 
 @needs_exiftool
-def test_bytes_already_in_the_library_add_no_event(lib):
-    old, new = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9))
-    add_item(lib, old)
-    before = snapshot(lib)
-    assert run(lib, cand("a/OLD.JPG", old)) == summary(already_in_library=1)
-    assert snapshot(lib) == before  # nothing new: not even a sources/ folder
-    got = run(lib, cand("a/OLD.JPG", old), cand("a/NEW.JPG", new))
-    assert got == summary(imported=1, already_in_library=1, bytes=len(new))
-    assert [e["item"] for e in read_all(lib) if e["op"] == "import"] == [sha(old), sha(new)]
+def test_bytes_in_the_library_get_this_source_as_another_reference(lib):
+    old = exif_jpeg((1, 2, 3))
+    add_item(lib, old, name="OLD.JPG")
+    before = files_of(lib)
+    again = cand("Trip/OLD.JPG", old, albums=("Trip",), favorite=True, trashed=True)
+    assert run(lib, again) == summary(already_in_library=1, album_links=1, favorites=1)
+    assert files_of(lib) == before  # nothing moves, and a new source never trashes what the library holds
+    (folder,) = lib.sources.iterdir()
+    item = fold(read_all(lib)).items[sha(old)]
+    assert (item.status, item.favorite, item.albums, item.imports[1:]) == ("live", True, {("album", "Trip")},
+                                                                           [folder.name])
+    assert [e["op"] for e in read_all(lib) if e.get("item") == sha(old)] == ["import", "import", "album.add",
+                                                                             "favorite"]
     assert [(f["source_path"], f["path"]) for f in manifest(lib)["files"]] == [
-        ("a/OLD.JPG", None), ("a/NEW.JPG", "originals/2024/03/NEW.JPG")]
+        ("Trip/OLD.JPG", "originals/2024/01/OLD.JPG")]
+    assert verify(lib).ok
+    log = read_all(lib)
+    assert run(lib, again) == summary(already_in_library=1)  # this source is recorded already
+    assert read_all(lib) == log
+
+
+@needs_exiftool
+def test_metadata_is_kept_when_nothing_is_new(lib):
+    photo, clip = exif_jpeg(), b"live clip"
+    held(lib, photo, clip)
+    log = read_all(lib)
+    got = run(lib, cand("a/IMG_1.MOV", clip), sources=(SourceFile("a/IMG_1.MOV.json", lambda: b"{}"),))
+    assert got == summary(already_in_library=1)
+    assert read_all(lib) == log  # a clip's bytes are no item of their own to refer to
+    (folder,) = lib.sources.iterdir()
+    assert (folder / "a/IMG_1.MOV.json").read_bytes() == b"{}"
+    assert manifest(lib)["files"][0]["path"] == "originals/2024/01/IMG_1.MOV"
 
 
 @needs_exiftool
@@ -122,6 +153,19 @@ def test_deleted_photo_is_not_imported_again(lib, how, arrives_as):
 
 
 @needs_exiftool
+def test_deleted_photo_is_skipped_in_every_copy(lib):
+    # Only the copy with the provider's date has the deleted photo's fingerprint; the other has no date at all.
+    dated = provider_record(taken="2023-07-15T12:00:00Z")
+    fp = fingerprint(derive({"Model": "Pixel 7", "ImageWidth": 8, "ImageHeight": 6}, dated, "IMG_9.JPG", None))
+    gone, again = exif_jpeg((7, 7, 7), taken=None), exif_jpeg((5, 5, 5), taken=None)
+    events.append(lib, [imp(sha(gone), fingerprint=list(fp), copy=lib.copy_id),
+                        ev("trash", sha(gone), ts=T1, copy=lib.copy_id)])
+    got = run(lib, cand("Trip/IMG_9.JPG", again), cand("Photos from 2023/IMG_9.JPG", again, provider=dated))
+    assert got == summary(skipped_deleted=2)
+    assert sha(again) not in fold(read_all(lib)).items
+
+
+@needs_exiftool
 def test_fingerprint_of_a_live_item_makes_a_version(lib):
     first, other = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9))
     events.append(lib, [imp(sha(first), fingerprint=FP, copy=lib.copy_id)])
@@ -130,11 +174,19 @@ def test_fingerprint_of_a_live_item_makes_a_version(lib):
 
 
 @needs_exiftool
+def test_two_versions_in_one_import_are_linked(lib):
+    first, other = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9))  # one fingerprint
+    assert run(lib, cand("x/IMG_1.JPG", first), cand("y/IMG_2.JPG", other))["versions"] == 1
+    assert fold(read_all(lib)).items[sha(other)].version_of == sha(first)
+
+
+@needs_exiftool
 def test_live_clip_and_edit_are_linked_to_their_photo(lib):
     photo, edit, clip = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9)), b"live clip"
     got = run(lib, cand("a/IMG_1-edited.JPG", edit, edit_of="a/IMG_1.JPG"),
               cand("a/IMG_1.MP4", clip, live_of="a/IMG_1.JPG"), cand("a/IMG_1.JPG", photo))
-    assert got == summary(imported=2, edits=1, live_clips=1, bytes=len(photo) + len(edit) + len(clip))
+    # one fingerprint, so the photo is also a version of the edit listed before it
+    assert got == summary(imported=2, versions=1, edits=1, live_clips=1, bytes=len(photo) + len(edit) + len(clip))
     state = fold(read_all(lib))
     assert {f["role"]: f["name"] for f in state.items[sha(photo)].files} == {"main": "IMG_1.JPG", "live": "IMG_1.MP4"}
     assert (lib.originals / "2024/03/IMG_1.MP4").read_bytes() == clip
@@ -144,11 +196,39 @@ def test_live_clip_and_edit_are_linked_to_their_photo(lib):
 
 
 @needs_exiftool
-def test_clip_is_skipped_with_its_photo(lib):
-    photo = exif_jpeg()
-    add_item(lib, photo)
-    got = run(lib, cand("a/IMG_1.JPG", photo), cand("a/IMG_1.MP4", b"live clip", live_of="a/IMG_1.JPG"))
-    assert got == summary(already_in_library=2)
+@pytest.mark.parametrize("library_clip", ["the same", "none"])
+def test_clip_of_a_photo_in_the_library_counts_by_its_own_bytes(lib, library_clip):
+    photo, clip = exif_jpeg(), b"live clip"
+    held(lib, photo, clip if library_clip == "the same" else None)
+    got = run(lib, cand("a/IMG_1.JPG", photo), cand("a/IMG_1.MOV", clip, live_of="a/IMG_1.JPG"))
+    if library_clip == "the same":
+        assert got == summary(already_in_library=2)
+    else:
+        assert got == summary(already_in_library=1, problems=[{"source_path": "a/IMG_1.MOV",
+                                                               "reason": "clip not in library"}])
+
+
+@needs_exiftool
+def test_clip_of_another_copy_counts_by_its_own_bytes(lib):
+    photo, clip, other = exif_jpeg(), b"live clip", b"another clip"
+    got = run(lib, cand("x/IMG_1.JPG", photo),
+              cand("y/IMG_1.JPG", photo), cand("y/IMG_1.MP4", clip, live_of="y/IMG_1.JPG"),
+              cand("z/IMG_1.JPG", photo), cand("z/IMG_1.MP4", clip, live_of="z/IMG_1.JPG"),
+              cand("w/IMG_1.JPG", photo), cand("w/IMG_1.MP4", other, live_of="w/IMG_1.JPG"))
+    # x has no clip, so y's is the item's: a clip only one copy has is not lost
+    assert got == summary(imported=1, live_clips=1, duplicates_in_source=4, bytes=len(photo) + len(clip),
+                          problems=[{"source_path": "w/IMG_1.MP4", "reason": "clip not in library"}])
+    assert {f["role"]: f["sha256"] for f in fold(read_all(lib)).items[sha(photo)].files}["live"] == sha(clip)
+
+
+@needs_exiftool
+def test_clip_whose_bytes_were_deleted_is_left_out(lib):
+    photo, clip = exif_jpeg(), b"live clip"
+    events.append(lib, [imp(sha(clip), name="IMG_1.MP4", copy=lib.copy_id), ev("trash", sha(clip), ts=T1,
+                                                                               copy=lib.copy_id)])
+    got = run(lib, cand("a/IMG_1.JPG", photo), cand("a/IMG_1.MP4", clip, live_of="a/IMG_1.JPG"))
+    assert got == summary(imported=1, skipped_deleted=1, bytes=len(photo))
+    assert [f["role"] for f in fold(read_all(lib)).items[sha(photo)].files] == ["main"]
 
 
 @needs_exiftool
@@ -201,20 +281,50 @@ def test_trashed_in_the_source_is_imported_then_trashed(lib):
 def test_trash_in_an_import_does_not_block_a_version_in_it(lib):
     a, b = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9))  # one fingerprint
     run(lib, cand("x/IMG_1.JPG", a, trashed=True), cand("y/IMG_2.JPG", b))
-    assert fold(read_all(lib)).items[sha(b)].status == "live"
+    item = fold(read_all(lib)).items[sha(b)]
+    assert (item.status, item.version_of) == ("live", sha(a))
     assert verify(lib).ok
 
 
 @needs_exiftool
-def test_unreadable_files_are_problems_and_the_rest_imports(lib):
-    good = exif_jpeg()
-    short = dataclasses.replace(cand("a/SHORT.JPG", b"xx"), size=5)
-    got = run(lib, dataclasses.replace(cand("a/GONE.JPG", b"xx"), read=unplugged), short, cand("a/IMG_1.JPG", good))
-    assert got == summary(imported=1, bytes=len(good), problems=[
-        {"source_path": "a/GONE.JPG", "reason": "could not be read: source unplugged"},
-        {"source_path": "a/SHORT.JPG", "reason": "2 bytes read, 5 listed"}])
-    assert [f["sha256"] for f in manifest(lib)["files"]][:2] == [None, None]
+def test_unreadable_file_is_imported_by_a_later_run(lib):
+    good, flaky = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9))
+    first = run(lib, cand("x/1.JPG", good), dataclasses.replace(cand("x/2.JPG", flaky), read=unplugged),
+                dataclasses.replace(cand("x/3.JPG", b"xx"), size=5))
+    assert first == summary(imported=1, bytes=len(good), problems=[
+        {"source_path": "x/2.JPG", "reason": "could not be read: source unplugged"},
+        {"source_path": "x/3.JPG", "reason": "2 bytes read, 5 listed"}])
+    (earlier,) = lib.sources.iterdir()
+    assert [f["source_path"] for f in manifest(lib)["files"]] == ["x/1.JPG"]  # nothing unread recorded as final
+    repaired = [cand("x/1.JPG", good), cand("x/2.JPG", flaky), cand("x/3.JPG", b"xxxxx")]
+    # flaky shares good's fingerprint: another version of it
+    assert run(lib, *repaired) == summary(imported=2, versions=1, already_in_library=1, bytes=len(flaky) + 5)
+    (later,) = set(lib.sources.iterdir()) - {earlier}
+    assert fold(read_all(lib)).items[sha(flaky)].imports == [later.name]
     assert verify(lib).ok
+    log = read_all(lib)
+    assert run(lib, *repaired) == summary(already_in_library=3)
+    assert read_all(lib) == log and len(list(lib.sources.iterdir())) == 2
+
+
+@needs_exiftool
+def test_photo_waits_for_its_unreadable_clip(lib):
+    photo, clip = exif_jpeg(), b"live clip"
+    pair = [cand("a/IMG_1.JPG", photo), cand("a/IMG_1.MP4", clip, live_of="a/IMG_1.JPG")]
+    got = run(lib, pair[0], dataclasses.replace(pair[1], read=unplugged))
+    assert got == summary(problems=[{"source_path": "a/IMG_1.MP4", "reason": "could not be read: source unplugged"},
+                                    {"source_path": "a/IMG_1.JPG",
+                                     "reason": "waits for a/IMG_1.MP4, which could not be read"}])
+    assert list(lib.sources.iterdir()) == [] and staged(lib) == []
+    assert run(lib, *pair) == summary(imported=1, live_clips=1, bytes=len(photo) + len(clip))
+
+
+@needs_exiftool
+def test_unreadable_metadata_file_stops_the_run_before_any_write(lib):
+    before = snapshot(lib)
+    with pytest.raises(ImportFailed, match=r"^a/x\.json could not be read \(source unplugged\); nothing was imported$"):
+        run(lib, cand("a/x.jpg", exif_jpeg()), sources=(SourceFile("a/x.json", unplugged),))
+    assert snapshot(lib) == before
 
 
 @needs_exiftool
@@ -226,6 +336,31 @@ def test_dry_run_changes_no_truth_layer_and_counts_the_same(lib):
     assert snapshot(lib) == before and staged(lib) == []
     assert got == run(lib, *cands)
     assert got["imported"] == 2
+
+
+@needs_exiftool
+def test_dry_run_that_fails_leaves_no_staging(lib):
+    put(lib, "originals/2024/03/IMG_1.JPG", b"dropped in by hand")
+    with pytest.raises(ImportFailed):
+        run(lib, cand("a/IMG_1.JPG", exif_jpeg()), dry_run=True)
+    assert staged(lib) == []
+
+
+@needs_exiftool
+def test_dry_run_keeps_the_staging_a_cut_off_run_left(lib, monkeypatch):
+    cands = [cand("x/IMG_1.JPG", exif_jpeg())]
+
+    def cut_off(*_):
+        raise OSError("power lost")
+
+    monkeypatch.setattr(staging.Stage, "exif", cut_off)
+    with pytest.raises(OSError, match="power lost"):
+        run(lib, *cands)
+    monkeypatch.undo()
+    left = staged(lib)
+    assert run(lib, *cands, dry_run=True)["imported"] == 1
+    assert staged(lib) == left
+    assert run(lib, dataclasses.replace(cands[0], read=unplugged))["imported"] == 1  # what was staged is used
 
 
 @needs_exiftool
@@ -243,13 +378,71 @@ def test_run_cut_off_before_the_log_is_finished_without_reading_the_source_again
         run(lib, *cands)
     assert staged(lib)  # kept for the next run
     got = run(lib, *(dataclasses.replace(c, read=unplugged) for c in cands))
-    assert got == summary(imported=2, album_links=1, bytes=len(a) + len(b))
+    assert got == summary(imported=2, versions=1, album_links=1, bytes=len(a) + len(b))
     (folder,) = lib.sources.iterdir()
     imports = [e for e in read_all(lib) if e["op"] == "import"]
     assert sorted(e["item"] for e in imports) == sorted([sha(a), sha(b)])
     assert {e["import"] for e in imports} == {folder.name}
     assert [e["op"] for e in read_all(lib)].count("album.add") == 1
     assert verify(lib).ok and staged(lib) == []
+
+
+@needs_exiftool
+def test_run_cut_off_after_the_log_refreshes_the_index_next_time(lib, monkeypatch):
+    data = exif_jpeg()
+    real = Cache.refresh
+
+    def cut_off(self, **_):
+        monkeypatch.setattr(Cache, "refresh", real)
+        raise OSError("power lost")
+
+    monkeypatch.setattr(Cache, "refresh", cut_off)
+    with pytest.raises(OSError, match="power lost"):
+        run(lib, cand("a/IMG_1.JPG", data))
+    assert Cache(lib).items_json() == []
+    assert run(lib, cand("a/IMG_1.JPG", data)) == summary(already_in_library=1)
+    assert [r["id"] for r in Cache(lib).items_json()] == [sha(data)]
+    assert staged(lib) == []
+
+
+@needs_exiftool
+def test_folders_are_flushed_before_the_log_names_their_files(lib, monkeypatch):
+    order: list = []
+    real_flush, real_append = fsops.fsync_dir, events.append
+
+    def flush(folder):
+        order.append(folder)
+        real_flush(folder)
+
+    def append(*args):
+        order.append("log")
+        real_append(*args)
+
+    monkeypatch.setattr(fsops, "fsync_dir", flush)
+    monkeypatch.setattr(events, "append", append)
+    run(lib, cand("a/IMG_1.JPG", exif_jpeg()))
+    assert order.index(lib.originals / "2024/03") < order.index("log")
+    assert order.index(lib.originals / "2024") < order.index("log")
+    assert order.index(lib.sources) < order.index("log")
+
+
+@needs_exiftool
+def test_exiftool_reads_every_staged_file_whatever_its_name(lib):
+    hidden, odd = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9))
+    run(lib, cand(".hidden/IMG_1.JPG", hidden), cand("a/IMG_2.dat", odd))
+    state = fold(read_all(lib))
+    assert state.items[sha(hidden)].fingerprint == tuple(FP)
+    assert state.items[sha(odd)].folder == "2024/03"
+
+
+@needs_exiftool
+def test_staged_files_keep_the_source_date(lib):
+    data = exif_jpeg()
+    run(lib, cand("a/IMG_1.JPG", data, mtime="2021-05-06T12:00:00Z"))
+    (folder,) = lib.sources.iterdir()
+    (record,) = json.loads((folder / "exif.json").read_bytes())
+    assert record["FileModifyDate"].startswith("2021:05:06")
+    assert (lib.originals / "2024/03/IMG_1.JPG").stat().st_mtime == datetime(2021, 5, 6, 12, tzinfo=UTC).timestamp()
 
 
 @needs_exiftool
@@ -266,7 +459,7 @@ def test_files_staged_whole_are_not_read_again_and_damaged_ones_are(lib, monkeyp
     (folder,) = (p for p in (lib.cache / "import").iterdir() if p.is_dir())
     (folder / "x/IMG_2.JPG").write_bytes(b"rotted")
     got = run(lib, dataclasses.replace(cands[0], read=unplugged), cands[1])
-    assert got == summary(imported=2, bytes=len(a) + len(b))
+    assert got == summary(imported=2, versions=1, bytes=len(a) + len(b))
     assert verify(lib).ok
 
 
@@ -310,7 +503,7 @@ def test_staged_file_on_another_filesystem_is_copied_verified(lib, monkeypatch):
 def test_imported_copy_syncs_whole_to_another(a, b):
     data = exif_jpeg()
     importer.run(a, "test", [cand("x/IMG_1.JPG", data, albums=("Trip",))],
-                 [SourceFile("x/IMG_1.JPG.json", lambda: b"{}")], False, datetime.now(UTC))
+                 [SourceFile("x/IMG_1.JPG.json", lambda: b"{}")], False, datetime.now(UTC), roots=())
     done = sync.run(a, b, datetime.now(UTC))
     assert (done.sources_conflicts, done.failed) == ([], [])
     assert (b.originals / "2024/03/IMG_1.JPG").read_bytes() == data
@@ -339,7 +532,8 @@ def test_missing_exiftool_is_a_one_line_error_before_any_write(lib, monkeypatch)
     assert snapshot(lib) == before and sorted(lib.cache.rglob("*")) == cache
 
 
-@pytest.mark.parametrize("path", ["../x.jpg", "/x.jpg", "a/./x.jpg", "a//x.jpg", "a/", "C:x.jpg", "a\\..\\x.jpg"])
+@pytest.mark.parametrize("path", ["../x.jpg", "/x.jpg", "a/./x.jpg", "a//x.jpg", "a/", "C:x.jpg", "a\\..\\x.jpg",
+                                  "a/x\n.jpg"])
 def test_source_path_leaving_its_folder_is_refused(lib, path):
     with pytest.raises(ImportFailed, match="unusable source path"):
         run(lib, cand(path, b"x"))
@@ -368,6 +562,7 @@ def test_refuses_a_source_overlapping_the_copy(tmp_path, where):
     else:
         source = tmp_path / "export"
         lib = init_library(source / "L", "laptop")
+    before = snapshot(lib)
     with pytest.raises(ImportFailed, match="overlap"):
-        importer.refuse_overlap(lib, [tmp_path / "elsewhere", source])
-    importer.refuse_overlap(lib, [tmp_path / "elsewhere"])
+        run(lib, cand("a/x.jpg", b"x"), roots=(tmp_path / "elsewhere", source))
+    assert snapshot(lib) == before

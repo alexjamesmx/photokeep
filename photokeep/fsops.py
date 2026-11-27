@@ -206,6 +206,18 @@ def inside(lib: Library, path: Path) -> bool:
     return any(path.resolve().is_relative_to(root / top) for top in ("originals", "trash"))
 
 
+def fsync_dir(folder: Path) -> None:
+    """Flush a folder's entries, so a file created or renamed into it survives a power cut. Windows cannot open
+    a folder to flush it, so there this does nothing."""
+    if not hasattr(os, "O_DIRECTORY"):
+        return
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def overlap(a: Path, b: Path) -> bool:
     """True when a and b, symlinks resolved, are one folder or one lies inside the other."""
     a, b = a.resolve(), b.resolve()

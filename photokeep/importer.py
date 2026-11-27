@@ -1,79 +1,57 @@
 """The shared import pipeline (spec 6.6): an adapter lists candidate files and the provider files to keep; this
-stages and hashes them, reads their EXIF, skips what the library holds or deleted, and adds the rest.
+stages and hashes them, reads their EXIF, skips what the library deleted, records a second source for what it
+holds, and adds the rest.
 
 Files go into place first and the log is written last, in one append, so a run that was cut off is finished by
-running it again: it reuses the import id, the staged files and the sources/ folder the first run left.
+running it again. A file that cannot be read is left for a later run, under a new import id: an import folder
+only records files whose fate is settled.
 """
 import hashlib
 import json
 import os
 import re
-from collections import Counter
+import zipfile
+import zlib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
-from pathlib import Path, PureWindowsPath
-from typing import BinaryIO
+from datetime import datetime
+from pathlib import Path, PurePosixPath, PureWindowsPath
 
 from photokeep import __version__, events, fsops
 from photokeep.cache import Cache, regular
 from photokeep.hashcache import HashCache
+from photokeep.importplan import Candidate, Planned, SourceFile, clips_of, events_of, plan, problem, summary, waiting
 from photokeep.library import Library, locked
-from photokeep.metadata import derive, fingerprint
-from photokeep.paths import assign, folder_of
-from photokeep.staging import UNREADABLE, ImportFailed, Say, Stage, durable, exiftool, import_id_for, \
-    keep_sources, listing, problem, ticking, why
-from photokeep.state import State, fold
+from photokeep.paths import assign
+from photokeep.progress import Say, ticking
+from photokeep.sources import durable, find_folder, read_folder, write_folder
+from photokeep.staging import ImportFailed, Stage, exiftool, staged_id
+from photokeep.state import fold
 
 _ADAPTER = re.compile(r"[a-z0-9]+")  # the middle of an import id
 _OWN = frozenset({"exif.json", "manifest.json"})  # Photokeep's files in sources/<import id>/
-
-
-@dataclass(frozen=True)
-class Candidate:
-    """A media file an adapter found."""
-    source_path: str  # relative POSIX path inside the source
-    read: Callable[[], BinaryIO]
-    size: int
-    mtime: str | None  # UTC ISO, as the source gives it
-    name: str  # the original name the item keeps
-    provider: dict  # metadata.provider_record of what the provider says about it, or {}
-    albums: tuple[str, ...] = ()
-    trashed: bool = False  # in the provider's trash: imported, then trashed
-    favorite: bool = False
-    live_of: str | None = None  # source_path of the photo this clip belongs to
-    edit_of: str | None = None  # source_path of the original
-
-
-@dataclass(frozen=True)
-class SourceFile:
-    """A provider's metadata file, kept verbatim as sources/<import id>/<path>."""
-    path: str
-    read: Callable[[], bytes]
+_UNREADABLE = (OSError, EOFError, zipfile.BadZipFile, zlib.error)  # a file gone, a damaged zip member
+_IN_LIBRARY = frozenset({"imported", "live_clips", "already_in_library", "duplicates_in_source"})
 
 
 @dataclass
-class _New:
-    """An item the import adds, with what its copies in the source say."""
-    main: Candidate
-    sha: str
-    folder: str
-    fingerprint: list | None
-    version_of: str | None
-    albums: set[str]
-    favorite: bool
-    trashed: bool  # every copy is in the provider's trash
-    clip: tuple[Candidate, str] | None  # the Live clip and its SHA-256
-    edit_of: str | None = None
+class _Batch:
+    """The candidates one import id records: an earlier run wrote its sources/ folder, or this run staged them."""
+    stage: Stage
+    candidates: list[Candidate]
+    shas: dict[str, str]
+    raw_exif: bytes
+    exif: dict[str, dict]
 
-    def files(self) -> list[tuple[str, Candidate, str]]:
-        """(role, candidate, SHA-256) of each file, the main one first."""
-        return [("main", self.main, self.sha), *([("live", *self.clip)] if self.clip else [])]
+
+def _why(e: BaseException) -> str:
+    return fsops.failure(e) if isinstance(e, OSError) else str(e)  # a full disk stops the run
 
 
 def _usable(path: str) -> bool:
-    """A relative path that stays inside the folder it is joined to, on any system."""
-    return (not PureWindowsPath(path).drive and not {"\\", "\0"} & set(path)
+    """A relative path that stays inside the folder it is joined to, on any system, and fits on one line of an
+    exiftool argument file."""
+    return (not PureWindowsPath(path).drive and not {"\\", "\0", "\n", "\r"} & set(path)
             and all(part not in ("", ".", "..") for part in path.split("/")))
 
 
@@ -89,156 +67,127 @@ def _check_listing(candidates: list[Candidate], sources: list[SourceFile]) -> No
             seen.add(path)
 
 
-def refuse_overlap(lib: Library, sources: Iterable[Path]) -> None:
+def _refuse_overlap(lib: Library, roots: Iterable[Path]) -> None:
     """The copy is written to and the sources only read, so neither may lie inside the other."""
-    for source in sources:
-        if fsops.overlap(lib.root, source):
-            raise ImportFailed(f"{lib.root} and {source} overlap: the copy must lie outside every source")
+    for root in roots:
+        if fsops.overlap(lib.root, root):
+            raise ImportFailed(f"{lib.root} and {root} overlap: the copy must lie outside every source")
 
 
 def _tag(candidates: list[Candidate]) -> str:
-    """The same listing gives the same tag, so a run after a cut-off one finds its import id."""
-    return hashlib.sha256(json.dumps(listing(candidates)).encode()).hexdigest()[:6]
+    """The same listing gives the same tag, so a later run finds the import folder an earlier one wrote."""
+    listing = sorted((c.source_path, c.size) for c in candidates)
+    return hashlib.sha256(json.dumps(listing).encode()).hexdigest()[:6]
 
 
-def _read_kept(sources: list[SourceFile], problems: list[dict]) -> dict[str, bytes]:
+def _read_kept(sources: list[SourceFile]) -> dict[str, bytes]:
+    """Every metadata file's bytes. Adapters read them to list the candidates, so one that fails now means the
+    source changed meanwhile: the run stops before it writes anything."""
     kept = {}
     for s in sources:
         try:
             kept[s.path] = s.read()
-        except UNREADABLE as e:
-            problems.append({"source_path": s.path, "reason": f"could not be read: {why(e)}"})
+        except _UNREADABLE as e:
+            raise ImportFailed(f"{s.path} could not be read ({_why(e)}); nothing was imported") from None
     return kept
 
 
-def _version_of(state: State, fp: tuple | None) -> str | None:
-    """The first live item with this fingerprint: the candidate is another version of it (spec 6.3)."""
-    same = [state.items[i] for i in state.fingerprints.get(fp, ())] if fp else []
-    live = [i for i in same if i.status == "live"]
-    return min(live, key=lambda i: (i.first_ts, i.id)).id if live else None
+def _earlier(lib: Library, adapter: str, candidates: list[Candidate],
+             open_stage: Callable[[str], Stage]) -> tuple[list[_Batch], list[Candidate]]:
+    """The batches earlier runs of this source recorded in sources/, each found by the tag of what was left
+    before it, and the candidates none of them records."""
+    batches: list[_Batch] = []
+    rest = candidates
+    while rest and (folder := find_folder(lib, adapter, _tag(rest))):
+        try:
+            files, raw, exif = read_folder(folder)
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            raise ImportFailed(f"{folder} cannot be read ({type(e).__name__}: {e})") from None
+        mine = [c for c in rest if c.source_path in files]
+        if not mine or len(mine) != len(files) or any(files[c.source_path][1] != c.size for c in mine):
+            raise ImportFailed(f"{folder} lists other files than this source")
+        shas = {c.source_path: files[c.source_path][0] for c in mine}
+        batches.append(_Batch(open_stage(folder.name), mine, shas, raw, exif))
+        rest = [c for c in rest if c.source_path not in files]
+    return batches, rest
 
 
-def _plan(state: State, candidates: list[Candidate], hashed: dict[str, str], exif: dict[str, dict],
-          problems: list[dict]) -> tuple[list[_New], Counter]:
-    """The items to add in source order, and how many candidates each kind of skip took."""
-    by_path = {c.source_path: c for c in candidates}
-    clips: dict[str, Candidate] = {}
-    for c in candidates:
-        if c.live_of in by_path and c.live_of != c.source_path:
-            clips.setdefault(c.live_of, c)
-    attached = {c.source_path for c in clips.values()}
-    live = {f["sha256"] for i in state.items.values() if i.status == "live" for f in i.files}
-    gone = {f["sha256"] for i in state.items.values() if i.blocked for f in i.files}
-
-    def skip(sha: str, fp: tuple | None) -> str | None:
-        known = state.items.get(sha)
-        # A known item is judged by its own state, as fold does: versions share fingerprints.
-        if known.blocked if known else sha in gone or state.is_blocked(sha, fp):
-            return "skipped_deleted"
-        return "already_in_library" if sha in live else None
-
-    new: dict[str, _New] = {}
-    skipped: Counter = Counter()
-    for c in candidates:
-        if c.source_path in attached:
-            continue
-        found = clips.get(c.source_path)
-        clip = (found, hashed[found.source_path]) if found and found.source_path in hashed else None
-        sha = hashed.get(c.source_path)
+def _stage_rest(stage: Stage, rest: list[Candidate], clips: dict[str, Candidate], tool: str,
+                problems: list[dict], say: Say) -> _Batch:
+    """Stage what no earlier run recorded and read its EXIF. A file that cannot be read, and any that waits for
+    it, is a problem this batch leaves out, for a later run to import."""
+    shas = {}
+    for c in ticking(rest, len(rest), say, "staging"):
+        sha = stage.intact(c.source_path, c.size)
         if sha is None:
-            if clip:
-                problems.append(problem(clip[0], f"its photo {c.source_path} could not be read"))
-            continue
-        meta = derive(exif.get(c.source_path, {}), c.provider, c.name, c.mtime)
-        fp = fingerprint(meta)
-        if verdict := skip(sha, fp):
-            skipped[verdict] += 1 + bool(clip)  # a clip goes where its photo goes
-            continue
-        if clip and skip(clip[1], None) == "skipped_deleted":
-            skipped["skipped_deleted"] += 1
-            clip = None
-        if it := new.get(sha):
-            skipped["duplicates_in_source"] += 1
-            it.albums.update(c.albums)
-            it.favorite, it.trashed = it.favorite or c.favorite, it.trashed and c.trashed
-            if clip and it.clip is None:  # a clip only this copy has is not lost
-                it.clip = clip
-            elif clip:
-                skipped["duplicates_in_source"] += 1
-            continue
-        new[sha] = _New(c, sha, folder_of(meta["taken"]), list(fp) if fp else None, _version_of(state, fp),
-                        set(c.albums), c.favorite, c.trashed, clip)
-    for it in new.values():
-        original = it.main.edit_of
-        target = hashed.get(original) if original else None
-        if original is None or target == it.sha:
-            continue
-        if target and (target in new or target in state.items and state.items[target].status == "live"):
-            it.edit_of = target
-        else:
-            problems.append(problem(it.main, f"its original {original} was not imported: kept without the link"))
-    return list(new.values()), skipped
+            try:
+                sha, size = stage.put(c.source_path, c.read, c.mtime)
+            except _UNREADABLE as e:
+                problems.append(problem(c, f"could not be read: {_why(e)}"))
+                continue
+            if size != c.size:
+                problems.append(problem(c, f"{size} bytes read, {c.size} listed"))
+                continue
+        shas[c.source_path] = sha
+    waits = waiting(rest, shas, clips)
+    problems += [problem(c, f"waits for {waits[c.source_path]}, which could not be read")
+                 for c in rest if c.source_path in waits]
+    final = [c for c in rest if c.source_path in shas and c.source_path not in waits]
+    say("reading EXIF with exiftool")
+    raw, exif = stage.exif(tool, [c.source_path for c in final])
+    return _Batch(stage, final, {c.source_path: shas[c.source_path] for c in final}, raw, exif)
 
 
-def _events(lib: Library, import_id: str, adapter: str, new: list[_New], start: datetime) -> list[dict]:
-    """Every import first, then the marks: a trash folded before a later import of the same fingerprint would
-    make fold ignore that import. Each event a microsecond after the last keeps their order."""
-    plain: list[tuple[str, dict]] = []
-    for it in new:
-        files = [{"role": role, "name": c.name, "sha256": sha, "size": c.size, "mtime": c.mtime}
-                 for role, c, sha in it.files()]
-        links = {k: v for k, v in (("version_of", it.version_of), ("edit_of", it.edit_of)) if v}
-        plain.append(("import", {"item": it.sha, "import": import_id, "folder": it.folder, "files": files,
-                                 "fingerprint": it.fingerprint, **links}))
-    for it in new:
-        plain += [("album.add", {"item": it.sha, "kind": "album", "album": title}) for title in sorted(it.albums)]
-        plain += [("favorite", {"item": it.sha})] if it.favorite else []
-        plain += [("trash", {"item": it.sha, "reason": f"Trashed in {adapter}"})] if it.trashed else []
-    return [events.new_event(lib, op, ts=events.ts_str(start + timedelta(microseconds=k)), **fields)
-            for k, (op, fields) in enumerate(plain)]
+_Job = tuple[Candidate, str, str, Stage]  # candidate, SHA-256, library path, its staging
 
 
-def _jobs(lib: Library, new: list[_New], logged: list[dict]) -> list[tuple[Candidate, str, str]]:
-    """(candidate, SHA-256, library path) of every file the import puts in place, each path free or already
-    holding those bytes (put there by a cut-off run): nothing is ever overwritten."""
-    paths = assign(fold(events.ordered([*events.read_all(lib), *logged])))
+def _jobs(lib: Library, items: list[Planned], paths: dict[str, dict[str, str]],
+          stage_of: dict[str, Stage]) -> list[_Job]:
+    """Every file of a new item, with its library path: free, or already holding those bytes (put there by a
+    cut-off run). Nothing is ever overwritten."""
+    new = [it for it in items if not it.known]
     if lost := [it.main.source_path for it in new if it.sha not in paths]:
         raise ImportFailed(f"an event in the log dated after this run blocks importing {lost[0]}")
-    jobs = [(c, sha, paths[it.sha][role]) for it in new for role, c, sha in it.files()]
+    jobs = [(c, sha, paths[it.sha][role], stage_of[c.source_path]) for it in new for role, c, sha in it.files()]
     with HashCache(lib) as hashes:
 
         def free(dst: Path, sha: str) -> bool:
             return fsops.inside(lib, dst) and (not os.path.lexists(dst) or regular(dst) and hashes.sha(dst) == sha)
 
-        taken = [rel for _, sha, rel in jobs if not free(lib.root / rel, sha)]
+        taken = [rel for _, sha, rel, _ in jobs if not free(lib.root / rel, sha)]
     if taken:
         raise ImportFailed(f"{len(taken)} path(s) this import needs hold files the log does not know, first "
                            f"{taken[0]}: see photokeep verify {lib.root}")
     return jobs
 
 
-def _place(lib: Library, stage: Stage, jobs: list[tuple[Candidate, str, str]], say: Say) -> None:
+def _place(lib: Library, jobs: list[_Job], say: Say) -> None:
     with HashCache(lib) as hashes:
-        for c, sha, rel in ticking(jobs, len(jobs), say, "moving into the library"):
+        for c, sha, rel, stage in ticking(jobs, len(jobs), say, "moving into the library"):
             dst = lib.root / rel
             if regular(dst) and hashes.sha(dst) == sha:
                 continue  # moved by a cut-off run
-            stage.place(c.source_path, c.read, c.size, sha, dst)
+            stage.place(c.source_path, c.read, c.size, c.mtime, sha, dst)
             hashes.record(dst, sha)
 
 
-def _manifest(import_id: str, adapter: str, candidates: list[Candidate], hashed: dict[str, str],
-              jobs: list[tuple[Candidate, str, str]]) -> dict:
-    """Every candidate with the library path its bytes got here (None: not imported by this import)."""
-    placed = {sha: rel for _, sha, rel in jobs}
-    files = []
-    for c in candidates:
-        sha = hashed.get(c.source_path)
-        files.append({"source_path": c.source_path, "sha256": sha, "size": c.size, "mtime": c.mtime,
-                      "path": placed.get(sha) if sha else None})
-    # exif_root: the folder exiftool ran on, which every SourceFile in exif.json starts with
-    return {"import": import_id, "adapter": adapter, "tool": f"photokeep {__version__} import",
-            "exif_root": import_id, "files": files}
+def _flush(lib: Library, rels: list[str]) -> None:
+    """Flush every folder a file went into, up to originals/ or trash/, before the log names the files: else a
+    power cut could keep the log line and lose the rename on some file systems."""
+    folders = {lib.root.joinpath(*parts[:n]) for parts in (PurePosixPath(rel).parts for rel in rels)
+               for n in range(1, len(parts))}
+    for folder in sorted(folders):
+        fsops.fsync_dir(folder)
+
+
+def _manifest(batch: _Batch, adapter: str, outcome: dict[str, str], where: dict[str, str]) -> dict:
+    """Every candidate the batch records, with the library path of its bytes (None: the library has none)."""
+    files = [{"source_path": c.source_path, "sha256": batch.shas[c.source_path], "size": c.size, "mtime": c.mtime,
+              "path": where.get(batch.shas[c.source_path]) if outcome.get(c.source_path) in _IN_LIBRARY else None}
+             for c in batch.candidates]
+    # exif_root: the folder exiftool's paths start with, which every SourceFile in exif.json begins with
+    return {"import": batch.stage.id, "adapter": adapter, "tool": f"photokeep {__version__} import",
+            "exif_root": batch.stage.id, "files": files}
 
 
 def _fill(folder: Path, kept: dict[str, bytes], raw_exif: bytes) -> None:
@@ -247,19 +196,10 @@ def _fill(folder: Path, kept: dict[str, bytes], raw_exif: bytes) -> None:
     durable(folder / "exif.json", raw_exif)
 
 
-def _summary(new: list[_New], skipped: Counter, problems: list[dict]) -> dict:
-    return {"imported": len(new), "versions": sum(bool(it.version_of) for it in new),
-            "edits": sum(bool(it.edit_of) for it in new), "live_clips": sum(bool(it.clip) for it in new),
-            "already_in_library": skipped["already_in_library"],
-            "duplicates_in_source": skipped["duplicates_in_source"], "skipped_deleted": skipped["skipped_deleted"],
-            "trashed": sum(it.trashed for it in new), "album_links": sum(len(it.albums) for it in new),
-            "favorites": sum(it.favorite for it in new),
-            "bytes": sum(c.size for it in new for _, c, _ in it.files()), "problems": problems}
-
-
 def run(lib: Library, adapter: str, candidates: list[Candidate], sources: list[SourceFile], dry_run: bool,
-        now: datetime, progress: Say | None = None) -> dict:
+        now: datetime, progress: Say | None = None, *, roots: Iterable[Path]) -> dict:
     """Import the candidates into lib and keep the sources verbatim; with dry_run, only count what would happen.
+    roots are the source's files and folders on disk, which the copy must not overlap.
 
     Staging and exiftool run in a dry run too: cache/ is rebuildable, and the dry run removes the staging it made.
     """
@@ -267,24 +207,48 @@ def run(lib: Library, adapter: str, candidates: list[Candidate], sources: list[S
     if not _ADAPTER.fullmatch(adapter):
         raise ValueError(f"adapter {adapter!r} is not lower-case letters and digits")
     _check_listing(candidates, sources)
+    _refuse_overlap(lib, roots)
     tool = exiftool()
-    problems: list[dict] = []
-    kept = _read_kept(sources, problems)
+    kept, clips = _read_kept(sources), clips_of(candidates)
+    stages: list[Stage] = []
+
+    def open_stage(import_id: str) -> Stage:
+        stages.append(Stage(lib, import_id))
+        return stages[-1]
+
     with locked(lib):
-        state = fold(events.read_all(lib))
-        stage = Stage(lib, import_id_for(lib, adapter, _tag(candidates), now))
-        hashed, raw_exif, exif = stage.hashed(lib, candidates, tool, problems, say)
-        new, skipped = _plan(state, candidates, hashed, exif, problems)
-        if new:
-            logged = _events(lib, stage.id, adapter, new, now)
-            jobs = _jobs(lib, new, logged)
+        try:
+            state = fold(events.read_all(lib))
+            problems: list[dict] = []
+            batches, rest = _earlier(lib, adapter, candidates, open_stage)
+            current = _stage_rest(open_stage(staged_id(lib, adapter, _tag(rest), now)), rest, clips, tool,
+                                  problems, say) if rest else None
+            batches += [current] if current else []
+            shas = {p: sha for b in batches for p, sha in b.shas.items()}
+            exif = {p: record for b in batches for p, record in b.exif.items()}
+            import_of = {c.source_path: b.stage.id for b in batches for c in b.candidates}
+            items, outcome = plan(state, candidates, shas, exif, import_of, clips, problems)
+            logged = events_of(lib, items, adapter, now)
+            after = fold(events.ordered([*events.read_all(lib), *logged]))
+            paths = assign(after)
+            jobs = _jobs(lib, items, paths, {c.source_path: b.stage for b in batches for c in b.candidates})
             if not dry_run:
-                keep_sources(lib, stage.id, _manifest(stage.id, adapter, candidates, hashed, jobs),
-                             lambda folder: _fill(folder, kept, raw_exif))
-                _place(lib, stage, jobs, say)
+                # Provider metadata is kept whenever a candidate is not one the library deleted.
+                if current and any(outcome.get(c.source_path) != "skipped_deleted" for c in current.candidates):
+                    where = {f["sha256"]: paths[i][f["role"]] for i in paths for f in after.items[i].files}
+                    raw = current.raw_exif
+                    write_folder(lib, current.stage.id, _manifest(current, adapter, outcome, where),
+                                 lambda folder: _fill(folder, kept, raw))
+                _place(lib, jobs, say)
+                _flush(lib, [rel for _, _, rel, _ in jobs])
                 events.append(lib, logged)
                 say("refreshing the viewer index")
                 Cache(lib).refresh(render=True)
-        if not dry_run or stage.created:
-            stage.remove()
-    return _summary(new, skipped, problems)
+                for stage in stages:
+                    stage.remove()
+        finally:
+            if dry_run:
+                for stage in stages:
+                    if stage.created:
+                        stage.remove()
+    return summary(items, outcome, logged, problems)

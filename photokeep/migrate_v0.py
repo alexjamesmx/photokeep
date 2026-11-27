@@ -19,7 +19,8 @@ from photokeep.library import Library, locked
 from photokeep.metadata import VIDEO_EXTS, derive, fingerprint
 from photokeep.paths import assign, folder_of
 from photokeep.providers import icloud
-from photokeep.staging import Say, exif_records, import_id_for, keep_sources, ticking
+from photokeep.progress import Say, ticking
+from photokeep.sources import exif_records, find_folder, new_id, write_folder
 from photokeep.state import fold
 
 _NOT_MEDIA = (".csv", ".zip")
@@ -299,7 +300,7 @@ def _write_sources(dest: Library, import_id: str, raw_dir: Path, items: list[_It
     # exif_root: the folder exiftool ran on, which every SourceFile in exif.json starts with
     manifest = {"import": import_id, "adapter": "icloud", "tool": f"photokeep {__version__} migrate-v0",
                 "exif_root": raw_dir.name, "files": _manifest_files(items, paths)}
-    keep_sources(dest, import_id, manifest, fill)
+    write_folder(dest, import_id, manifest, fill)
 
 
 def _refuse_overlap(dest: Library, old_root: Path, raw_dir: Path) -> None:
@@ -343,7 +344,9 @@ def migrate(old_root: Path, raw_dir: Path, zips: list[Path], dest: Library, dry_
                 "verify fails, delete that copy's folder and migrate into a new one (the prototype is untouched)")
         rows = _rows(db_path)
         # Named after the prototype's database, so a run after an interrupted one reuses its sources/ folder.
-        import_id = import_id_for(dest, "icloud", file_sha256(db_path)[:6], datetime.now(UTC))
+        tag = file_sha256(db_path)[:6]
+        folder = find_folder(dest, "icloud", tag)
+        import_id = folder.name if folder else new_id("icloud", tag, datetime.now(UTC))
         exif, members = _exif(raw_dir), zipscan.members(zips, skip=_NOT_MEDIA)
         hashed = _hash_files(sorted({old_root / r[c] for r in rows for c in ("path", "live") if r[c]}), say)
         problems: list[dict] = []
