@@ -51,7 +51,7 @@ def _name_date(name: str) -> datetime | None:
         return None
 
 
-def _taken(exif: dict, provider: dict | None, name: str, mtime: str | None):
+def _taken(exif: dict, provider: dict | None, name: str, mtime: str | None, video: bool):
     """Spec 6.3 precedence; returns (wall clock, tz, source) or (None, None, None)."""
     dt, tz = _exif_date(exif.get("DateTimeOriginal"), exif.get("OffsetTimeOriginal"))
     if dt:
@@ -59,9 +59,11 @@ def _taken(exif: dict, provider: dict | None, name: str, mtime: str | None):
     dt, tz = _exif_date(exif.get("CreationDate"))
     if dt:
         return dt, tz, "quicktime"
-    utc, _ = _exif_date(exif.get("CreateDate"))
-    if utc:
-        return *_local(utc.replace(tzinfo=timezone.utc)), "quicktime"
+    # exiftool -j names both tags CreateDate: a photo's EXIF one is the camera's wall clock, like
+    # DateTimeOriginal, and a video's QuickTime one is UTC.
+    dt, tz = _exif_date(exif.get("CreateDate"), None if video else exif.get("OffsetTimeDigitized"))
+    if dt:
+        return (*_local(dt.replace(tzinfo=timezone.utc)), "quicktime") if video else (dt, tz, "exif")
     utc = _utc_iso((provider or {}).get("originalCreationDate"))
     if utc:
         return *_local(utc), "provider"
@@ -75,9 +77,9 @@ def _taken(exif: dict, provider: dict | None, name: str, mtime: str | None):
 
 
 def derive(exif: dict, provider: dict | None, name: str, mtime: str | None) -> dict:
-    dt, tz, src = _taken(exif, provider, name, mtime)
     ext = PurePath(name).suffix.lower()
     is_video = str(exif.get("MIMEType") or "").startswith("video/") or ext in VIDEO_EXTS
+    dt, tz, src = _taken(exif, provider, name, mtime, is_video)
     is_png = str(exif.get("FileType") or "").upper() == "PNG" or ext == ".png"
     return {
         "kind": "video" if is_video else "photo",

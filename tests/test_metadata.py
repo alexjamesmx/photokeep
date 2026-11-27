@@ -25,6 +25,25 @@ def test_quicktime_create_date_is_utc_shown_local(mexico):
     assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", "-06:00", "quicktime")
 
 
+@pytest.mark.parametrize("exif, name", [({"MIMEType": "image/jpeg"}, "a.jpg"), ({"MIMEType": "image/heic"}, "a.HEIC"),
+                                         ({}, "a.png")])
+def test_photo_create_date_is_the_cameras_wall_clock(mexico, exif, name):
+    m = derive(exif | {"CreateDate": "2024:01:04 11:34:00"}, None, name, None)
+    assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", None, "exif")
+
+
+def test_photo_create_date_keeps_its_offset(mexico):
+    m = derive({"CreateDate": "2024:01:04 11:34:00", "OffsetTimeDigitized": "+02:00"}, None, "a.jpg", None)
+    assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", "+02:00", "exif")
+
+
+@pytest.mark.parametrize("exif, name", [({"MIMEType": "video/quicktime"}, "a.MOV"), ({"MIMEType": "video/mp4"}, "a.mov"),
+                                         ({}, "a.mp4")])
+def test_video_create_date_is_utc_shown_local(mexico, exif, name):
+    m = derive(exif | {"CreateDate": "2024:01:04 17:34:00"}, None, name, None)
+    assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", "-06:00", "quicktime")
+
+
 def test_provider_date_is_utc_shown_local(mexico):
     m = derive({}, {"originalCreationDate": "2024-01-04T17:34:00Z"}, "a.jpg", None)
     assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", "-06:00", "provider")
