@@ -16,6 +16,7 @@ class Item:
     first_ts: str
     fingerprint: tuple | None
     version_of: str | None
+    edit_of: str | None = None
     status: str = "live"  # live | trashed | purged
     trashed_at: str | None = None
     blocked: bool = False
@@ -79,7 +80,8 @@ class State:
             item.imports.append(e["import"])
             return
         # New, or a purged item that was readmitted: it starts over but keeps its marks.
-        fresh = Item(e["item"], e["folder"], e["files"], [e["import"]], e["ts"], fingerprint, e.get("version_of"))
+        fresh = Item(e["item"], e["folder"], e["files"], [e["import"]], e["ts"], fingerprint, e.get("version_of"),
+                     e.get("edit_of"))
         if item:
             fresh.favorite, fresh.hidden, fresh.albums = item.favorite, item.hidden, item.albums
         self.items[e["item"]] = fresh

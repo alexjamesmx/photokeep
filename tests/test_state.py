@@ -11,6 +11,7 @@ def test_first_import_creates_live_item():
     it = fold([e]).items["a"]
     assert (it.status, it.folder, it.first_ts, it.imports) == ("live", "2024/01", T0, [e["import"]])
     assert it.files == e["files"] and it.fingerprint == tuple(FP) and it.version_of == "b"
+    assert it.edit_of is None and fold([e | {"edit_of": "c"}]).items["a"].edit_of == "c"
 
 
 def test_later_import_of_live_item_appends_import_id():

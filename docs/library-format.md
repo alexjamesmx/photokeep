@@ -12,7 +12,7 @@ A library is a set of equal copies. Each copy is a folder; copies converge by ex
   sources/       untouched imports (opaque to the app)
   log/           <copy_id>.jsonl, one change log per copy
   trash/         <item id>/<name>: trashed items, <name> is the name the item has (or would have) in originals/
-  cache/         derived data (thumbnails, hashes); safe to delete
+  cache/         derived data (thumbnails, hashes, files an import is staging); safe to delete
   quarantine/    <run>/<path>: corrupt files `repair` replaced, kept for the owner; never synced, scanned or deleted
   app/           photokeep/: a copy of the app, so the copy opens on any computer with Python 3.11+
   Open Photos.sh, Open Photos.command, Open Photos.bat   start the viewer from app/ (Linux, macOS, Windows)
@@ -47,7 +47,7 @@ Common keys: `v` (1), `id` (uuid4 hex), `ts` (UTC, as above), `copy` (author's c
 | op | fields |
 |---|---|
 | `copy.name` | `name` |
-| `import` | `item`, `import` (import id), `folder` (`YYYY/MM` or `undated`), `files` (list of `{role: "main"\|"live", name, sha256, size, mtime}`, exactly one `main`, whose `sha256` is `item`), `fingerprint` (`[taken, model, w, h]` or null), `version_of` (sha or null) |
+| `import` | `item`, `import` (import id), `folder` (`YYYY/MM` or `undated`), `files` (list of `{role: "main"\|"live", name, sha256, size, mtime}`, exactly one `main`, whose `sha256` is `item`), `fingerprint` (`[taken, model, w, h]` or null), optional `version_of` and `edit_of` (the id of the item this one is another version, or an edit, of; absent or null when none) |
 | `favorite`, `unfavorite`, `hide`, `unhide`, `restore`, `readmit` | `item` |
 | `trash` | `item`, optional `reason` |
 | `purge` | `item`, optional `name` |

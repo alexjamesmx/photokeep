@@ -4,11 +4,7 @@ The prototype, the export's raw/ folder, exif.json and the zips are only read: f
 verification, so the prototype keeps working until the owner deletes it.
 """
 import json
-import os
-import shutil
 import sqlite3
-import time
-from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, nullcontext
 from dataclasses import dataclass
@@ -17,16 +13,15 @@ from pathlib import Path, PurePosixPath
 from typing import NamedTuple
 
 from photokeep import __version__, events, fsops, zipscan
-from photokeep.cache import Cache, exif_key, regular
+from photokeep.cache import Cache, regular
 from photokeep.hashcache import HashCache, file_sha256
 from photokeep.library import Library, locked
 from photokeep.metadata import VIDEO_EXTS, derive, fingerprint
-from photokeep.paths import assign, valid_folder
+from photokeep.paths import assign, folder_of
 from photokeep.providers import icloud
+from photokeep.staging import Say, exif_records, import_id_for, keep_sources, ticking
 from photokeep.state import fold
 
-Say = Callable[[str], None]
-_EVERY = 5.0  # seconds between progress lines
 _NOT_MEDIA = (".csv", ".zip")
 _MEASURED = ("w", "h", "sharp", "bright", "noise", "dhash")
 
@@ -62,16 +57,6 @@ class _Item:
         return self.row["sha256"]
 
 
-def _ticking(it: Iterable, total: int, say: Say, what: str) -> Iterator:
-    """Yield from it, telling `say` how far it got at most every few seconds: a whole library takes minutes."""
-    last = time.monotonic()
-    for n, x in enumerate(it, 1):
-        yield x
-        if n == total or time.monotonic() - last >= _EVERY:
-            say(f"{what}: {n}/{total}")
-            last = time.monotonic()
-
-
 def _rows(db_path: Path) -> list[dict]:
     if not db_path.is_file():
         raise MigrationError(f"{db_path} is missing: not a prototype library")
@@ -87,7 +72,7 @@ def _exif(raw_dir: Path) -> dict[str, dict]:
     if not raw_dir.is_dir() or not path.is_file():
         raise MigrationError(f"{raw_dir} must be the export's raw/ folder, with exif.json beside it")
     try:
-        return {exif_key(r["SourceFile"], raw_dir.name): r for r in json.loads(path.read_bytes())}
+        return exif_records(path.read_bytes(), raw_dir.name)
     except (ValueError, TypeError, KeyError) as e:  # bad JSON, or not a list of records with a SourceFile
         raise MigrationError(f"{path} is not exiftool -j output ({type(e).__name__}: {e})") from None
 
@@ -143,7 +128,7 @@ def _sha_size(path: Path) -> tuple[str, int] | None:
 def _hash_files(paths: list[Path], say: Say) -> dict[Path, tuple[str, int] | None]:
     # hashlib releases the GIL, so threads read several files at once.
     with ThreadPoolExecutor(8) as pool:
-        hashed = _ticking(pool.map(_sha_size, paths), len(paths), say, "hashing the prototype's files")
+        hashed = ticking(pool.map(_sha_size, paths), len(paths), say, "hashing the prototype's files")
         return dict(zip(paths, hashed, strict=True))
 
 
@@ -179,7 +164,6 @@ def _item(group: list[dict], root: Path, hashed: dict, exif: dict, clips: dict, 
               "mtime": None} for role, src, path, _ in kept]
     sources = [{"source_path": src, "sha256": hashed[path][0], "size": hashed[path][1], "mtime": None}
                for each in named for _, src, path, _ in each]
-    folder = f"{(row['taken'] or '')[:4]}/{(row['taken'] or '')[5:7]}"
     source = kept[0][1]  # the main file's
     meta = derive(exif.get(source, {}), provider.get(source), source.rpartition("/")[2], None)
     fp = fingerprint(meta)
@@ -189,7 +173,7 @@ def _item(group: list[dict], root: Path, hashed: dict, exif: dict, clips: dict, 
     albums: set[tuple[str, str]] = set()
     for r in group:
         albums |= {("album", t) for t in _titles(r, "albums")} | {("memory", t) for t in _titles(r, "memories")}
-    return _Item(row, folder if valid_folder(folder) else "undated", files,
+    return _Item(row, folder_of(row["taken"]), files,
                  {role: path for role, _, path, _ in kept}, sources, list(fp) if fp else None,
                  any(r["favorite"] for r in group), any(r["hidden"] for r in group), sorted(albums),
                  all(r["trashed"] for r in group), match)
@@ -226,7 +210,7 @@ def _tombstones(members: list[tuple[Path, str]], known: set[str], say: Say, prob
     """Media in the export whose bytes the library does not hold (deleted in the prototype or in Recently
     Deleted), by SHA-256, with its file name."""
     found: dict[str, str] = {}
-    shas = _ticking(zipscan.hashes(members), len(members), say, "hashing the zips")
+    shas = ticking(zipscan.hashes(members), len(members), say, "hashing the zips")
     for (z, member), digest in zip(members, shas, strict=True):
         if digest is None:
             problems.append({"source": f"{z.name}:{member}", "problem": "unreadable zip member"})
@@ -266,7 +250,7 @@ def _place(dest: Library, items: list[_Item], paths: dict[str, dict[str, str]], 
     """Copy every file to its final path; one already there with the right bytes is from an interrupted run."""
     jobs = [(it.old[f["role"]], dest.root / paths[it.id][f["role"]], f["sha256"]) for it in items for f in it.files]
     with HashCache(dest) as hashes:
-        for src, dst, digest in _ticking(jobs, len(jobs), say, "copying"):
+        for src, dst, digest in ticking(jobs, len(jobs), say, "copying"):
             if not (regular(dst) and hashes.sha(dst) == digest):
                 fsops.copy_verified(src, dst, digest)
                 hashes.record(dst, digest)
@@ -284,7 +268,7 @@ def _copy_cache_file(src: Path, dst: Path) -> bool:
 def _seed_cache(old_root: Path, dest: Library, items: list[_Item], say: Say) -> None:
     """Bring the prototype's thumbnails, previews and measurements along, so nothing is rendered again."""
     index, measured = Cache(dest), {}
-    for it in _ticking(items, len(items), say, "copying thumbnails"):
+    for it in ticking(items, len(items), say, "copying thumbnails"):
         r = it.row
         got = {flag: int(bool(r[flag]) and _copy_cache_file(
                    old_root / ".library" / folder / f"{r['id'] % 100:02d}" / f"{r['id']}.jpg", target))
@@ -293,13 +277,6 @@ def _seed_cache(old_root: Path, dest: Library, items: list[_Item], say: Say) -> 
         if got["thumb"]:
             measured[it.id] = {c: r[c] for c in _MEASURED} | got
     index.seed_media(measured)
-
-
-def _import_id(dest: Library, db_path: Path) -> str:
-    # Named after the prototype's database, so a run after an interrupted one reuses its sources/ folder.
-    tag = file_sha256(db_path)[:6]
-    found = sorted(p.name for p in dest.sources.glob(f"*-icloud-{tag}"))
-    return found[0] if found else f"{datetime.now():%Y-%m-%d}-icloud-{tag}"
 
 
 def _manifest_files(items: list[_Item], paths: dict[str, dict[str, str]]) -> list[dict]:
@@ -313,31 +290,22 @@ def _manifest_files(items: list[_Item], paths: dict[str, dict[str, str]]) -> lis
 
 def _write_sources(dest: Library, import_id: str, raw_dir: Path, items: list[_Item],
                    paths: dict[str, dict[str, str]]) -> None:
-    final = dest.sources / import_id
-    if final.exists():
-        return  # complete: an interrupted run moved it into place in one step
-    stage = dest.cache_dir() / "migrate-v0"
-    shutil.rmtree(stage, ignore_errors=True)  # an interrupted run's half-written folder
-    stage.mkdir()  # fails if anything, a symlink say, is still there: never write through it
-    for path in sorted(raw_dir.rglob("*.csv")):
-        fsops.copy_verified(path, stage / path.relative_to(raw_dir), file_sha256(path))
-    exif = raw_dir.parent / "exif.json"
-    fsops.copy_verified(exif, stage / "exif.json", file_sha256(exif))
+    def fill(folder: Path) -> None:
+        for path in sorted(raw_dir.rglob("*.csv")):
+            fsops.copy_verified(path, folder / path.relative_to(raw_dir), file_sha256(path))
+        exif = raw_dir.parent / "exif.json"
+        fsops.copy_verified(exif, folder / "exif.json", file_sha256(exif))
+
     # exif_root: the folder exiftool ran on, which every SourceFile in exif.json starts with
     manifest = {"import": import_id, "adapter": "icloud", "tool": f"photokeep {__version__} migrate-v0",
                 "exif_root": raw_dir.name, "files": _manifest_files(items, paths)}
-    with open(stage / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=1)
-        f.flush()
-        os.fsync(f.fileno())
-    os.rename(stage, final)
+    keep_sources(dest, import_id, manifest, fill)
 
 
 def _refuse_overlap(dest: Library, old_root: Path, raw_dir: Path) -> None:
     """The copy is written to and the prototype only read, so neither may lie inside the other."""
-    new = dest.root.resolve()
     for other in (old_root.resolve(), raw_dir.resolve()):
-        if new.is_relative_to(other) or other.is_relative_to(new):
+        if fsops.overlap(dest.root, other):
             raise MigrationError(f"{dest.root} and {other} overlap: the copy must lie outside the prototype "
                                  "and its export")
 
@@ -374,7 +342,8 @@ def migrate(old_root: Path, raw_dir: Path, zips: list[Path], dest: Library, dry_
                 f"off at the end, run `photokeep cache refresh {dest.root}` and `photokeep verify {dest.root}`; if "
                 "verify fails, delete that copy's folder and migrate into a new one (the prototype is untouched)")
         rows = _rows(db_path)
-        import_id = _import_id(dest, db_path)
+        # Named after the prototype's database, so a run after an interrupted one reuses its sources/ folder.
+        import_id = import_id_for(dest, "icloud", file_sha256(db_path)[:6], datetime.now(UTC))
         exif, members = _exif(raw_dir), zipscan.members(zips, skip=_NOT_MEDIA)
         hashed = _hash_files(sorted({old_root / r[c] for r in rows for c in ("path", "live") if r[c]}), say)
         problems: list[dict] = []

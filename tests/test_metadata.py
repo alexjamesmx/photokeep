@@ -1,6 +1,6 @@
 import pytest
 
-from photokeep.metadata import derive, fingerprint
+from photokeep.metadata import derive, fingerprint, provider_record
 
 
 def test_exif_date_with_offset():
@@ -10,7 +10,7 @@ def test_exif_date_with_offset():
 
 def test_exif_wins_over_everything():
     exif = {"DateTimeOriginal": "2024:01:04 11:34:00", "CreationDate": "2020:01:01 00:00:00+00:00"}
-    m = derive(exif, {"originalCreationDate": "2019-01-01T00:00:00Z"}, "20180101_000000.jpg", "2017-01-01T00:00:00Z")
+    m = derive(exif, provider_record(taken="2019-01-01T00:00:00Z"), "20180101_000000.jpg", "2017-01-01T00:00:00Z")
     assert m["taken"] == "2024-01-04T11:34:00"
     assert m["tz"] is None
 
@@ -45,8 +45,29 @@ def test_video_create_date_is_utc_shown_local(mexico, exif, name):
 
 
 def test_provider_date_is_utc_shown_local(mexico):
-    m = derive({}, {"originalCreationDate": "2024-01-04T17:34:00Z"}, "a.jpg", None)
+    m = derive({}, provider_record(taken="2024-01-04T17:34:00Z"), "a.jpg", None)
     assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", "-06:00", "provider")
+
+
+def test_provider_date_comes_after_quicktime_and_before_the_name(mexico):
+    provider = provider_record(taken="2024-01-04T17:34:00Z")
+    assert derive({"CreationDate": "2020:01:01 00:00:00+00:00"}, provider, "a.mov", None)["date_src"] == "quicktime"
+    assert derive({}, provider, "20180101_000000.jpg", None)["date_src"] == "provider"
+
+
+def test_provider_place_only_when_exif_has_none():
+    provider = provider_record(lat=19.4, lon=-99.1)
+    m = derive({}, provider, "a.jpg", None)
+    assert (m["lat"], m["lon"]) == (19.4, -99.1)
+    m = derive({"GPSLatitude": 1.5, "GPSLongitude": -2.5}, provider, "a.jpg", None)
+    assert (m["lat"], m["lon"]) == (1.5, -2.5)
+    assert derive({}, {}, "a.jpg", None)["lat"] is None
+
+
+def test_provider_record_has_the_shared_keys():
+    assert provider_record(taken="2024-01-04T17:34:00Z", albums=("Trip",), raw={"x": 1}) == {
+        "taken": "2024-01-04T17:34:00Z", "lat": None, "lon": None, "title": None, "description": None,
+        "favorite": False, "hidden": False, "albums": ["Trip"], "memories": [], "raw": {"x": 1}}
 
 
 @pytest.mark.parametrize("name", ["IMG 2024-01-04 11.34.56.jpg", "2024-01-04_11.34.56.jpg", "20240104_113456.jpg"])

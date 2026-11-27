@@ -9,6 +9,8 @@ from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 
+from photokeep.metadata import provider_record
+
 # Albums that duplicate the flags already read from Photo Details.
 FLAG_ALBUMS = {"Favorites", "Hidden"}
 APPLE_DATE = "%A %B %d,%Y %I:%M %p GMT"
@@ -62,12 +64,8 @@ def read(source_dir: Path) -> dict[str, dict]:
             name = row.get("imgName")  # a short row leaves its missing fields None
             if not name:
                 continue
-            out[f"{part}/Photos/{name}"] = {
-                "originalCreationDate": _utc_iso(row.get("originalCreationDate")),
-                "favorite": row.get("favorite") == "yes",
-                "hidden": row.get("hidden") == "yes",
-                "albums": list(albums.get(name, [])),
-                "memories": list(memories.get(name, [])),
-                "raw": row,
-            }
+            out[f"{part}/Photos/{name}"] = provider_record(
+                taken=_utc_iso(row.get("originalCreationDate")), favorite=row.get("favorite") == "yes",
+                hidden=row.get("hidden") == "yes", albums=albums.get(name, []), memories=memories.get(name, []),
+                raw=row)
     return out

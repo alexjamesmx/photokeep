@@ -1,7 +1,7 @@
 """Display metadata derived from a file's EXIF and the provider's export; never written back."""
 
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from datetime import datetime, timezone
 from pathlib import PurePath
 
@@ -70,7 +70,7 @@ def _taken(exif: dict, provider: dict | None, name: str, mtime: str | None, vide
     dt, tz = _exif_date(exif.get("CreateDate"), None if video else exif.get("OffsetTimeDigitized"))
     if dt:
         return (*_local(dt.replace(tzinfo=timezone.utc)), "quicktime") if video else (dt, tz, "exif")
-    utc = _utc_iso((provider or {}).get("originalCreationDate"))
+    utc = _utc_iso((provider or {}).get("taken"))
     if utc:
         return *_local(utc), "provider"
     dt = _name_date(name)
@@ -82,10 +82,23 @@ def _taken(exif: dict, provider: dict | None, name: str, mtime: str | None, vide
     return None, None, None
 
 
+def provider_record(*, taken: str | None = None, lat: float | None = None, lon: float | None = None,
+                    title: str | None = None, description: str | None = None, favorite: bool = False,
+                    hidden: bool = False, albums: Iterable[str] = (), memories: Iterable[str] = (),
+                    raw: object = None) -> dict:
+    """What every provider reader gives for one file: taken is UTC ISO with a Z, raw the provider's own record."""
+    return {"taken": taken, "lat": lat, "lon": lon, "title": title, "description": description, "favorite": favorite,
+            "hidden": hidden, "albums": list(albums), "memories": list(memories), "raw": raw}
+
+
 def derive(exif: dict, provider: dict | None, name: str, mtime: str | None) -> dict:
+    """Display metadata; of a provider record (provider_record's keys) only the date and place are read."""
     ext = PurePath(name).suffix.lower()
     is_video = str(exif.get("MIMEType") or "").startswith("video/") or ext in VIDEO_EXTS
     dt, tz, src = _taken(exif, provider, name, mtime, is_video)
+    lat, lon = exif.get("GPSLatitude"), exif.get("GPSLongitude")
+    if lat is None or lon is None:  # the file's own place wins; a provider's is a fallback
+        lat, lon = (provider or {}).get("lat"), (provider or {}).get("lon")
     is_png = str(exif.get("FileType") or "").upper() == "PNG" or ext == ".png"
     return {
         "kind": "video" if is_video else "photo",
@@ -98,8 +111,8 @@ def derive(exif: dict, provider: dict | None, name: str, mtime: str | None) -> d
         "codec": exif.get("CompressorID"),
         "make": exif.get("Make"),
         "model": exif.get("Model"),
-        "lat": exif.get("GPSLatitude"),
-        "lon": exif.get("GPSLongitude"),
+        "lat": lat,
+        "lon": lon,
         "screenshot": exif.get("UserComment") == "Screenshot" or (is_png and not exif.get("Model")),
     }
 

@@ -4,6 +4,7 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import BinaryIO
 
 from photokeep.hashcache import HashCache
 from photokeep.library import Library
@@ -41,25 +42,34 @@ def _refuse_existing(dst: Path) -> None:
         raise CopyError(f"{dst} already exists")
 
 
-def stage_verified(src: Path, dst: Path, sha: str) -> Path:
-    """Copy src to the temp file beside dst and check its bytes; the caller renames it into place."""
+def stage_stream(fin: BinaryIO, dst: Path) -> tuple[Path, str]:
+    """Copy a stream to the temp file beside dst, flushed to disk; the temp file and the SHA-256 of what was
+    written. The caller renames it into place."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + PART)
     part.unlink(missing_ok=True)  # left by an interrupted run; safe_name keeps originals off this name
     fd = os.open(part, _NEW_FILE, 0o666)
     try:
         digest = hashlib.sha256()
-        with os.fdopen(fd, "wb") as fout, open(src, "rb") as fin:
+        with os.fdopen(fd, "wb") as fout:
             while chunk := fin.read(_CHUNK):
                 digest.update(chunk)
                 fout.write(chunk)
             fout.flush()
             os.fsync(fout.fileno())
-        if digest.hexdigest() != sha:
-            raise HashMismatch(f"{src}: SHA-256 is {digest.hexdigest()}, expected {sha}")
     except BaseException:
         part.unlink(missing_ok=True)
         raise
+    return part, digest.hexdigest()
+
+
+def stage_verified(src: Path, dst: Path, sha: str) -> Path:
+    """Copy src to the temp file beside dst and check its bytes; the caller renames it into place."""
+    with open(src, "rb") as fin:
+        part, digest = stage_stream(fin, dst)
+    if digest != sha:
+        part.unlink(missing_ok=True)
+        raise HashMismatch(f"{src}: SHA-256 is {digest}, expected {sha}")
     return part
 
 
@@ -194,6 +204,12 @@ def inside(lib: Library, path: Path) -> bool:
     # The two are not resolved themselves, so a symlinked originals/ or trash/ counts as outside.
     root = lib.root.resolve()
     return any(path.resolve().is_relative_to(root / top) for top in ("originals", "trash"))
+
+
+def overlap(a: Path, b: Path) -> bool:
+    """True when a and b, symlinks resolved, are one folder or one lies inside the other."""
+    a, b = a.resolve(), b.resolve()
+    return a.is_relative_to(b) or b.is_relative_to(a)
 
 
 def _delete(lib: Library, cache: HashCache, rel: str, want: str | None) -> None:

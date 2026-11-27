@@ -54,6 +54,21 @@ def jpeg_bytes(color: tuple[int, int, int] = (200, 80, 40)) -> bytes:
     return buf.getvalue()
 
 
+def exif_jpeg(color: tuple[int, int, int] = (200, 80, 40), *, taken: str | None = "2024:03:05 10:00:00",
+              model: str | None = "Pixel 7", size: tuple[int, int] = (8, 6)) -> bytes:
+    """A JPEG whose EXIF holds a capture time and a camera, as exiftool reads them back."""
+    from PIL import Image
+
+    exif = Image.Exif()
+    if model:
+        exif[0x010F], exif[0x0110] = "Google", model  # Make, Model
+    if taken:
+        exif.get_ifd(0x8769)[0x9003] = taken  # DateTimeOriginal
+    buf = io.BytesIO()
+    Image.new("RGB", size, color).save(buf, "JPEG", exif=exif)
+    return buf.getvalue()
+
+
 def put(lib: Library, rel: str, data: bytes) -> Path:
     path = lib.root / rel
     path.parent.mkdir(parents=True, exist_ok=True)

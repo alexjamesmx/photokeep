@@ -33,6 +33,12 @@ def valid_folder(folder: object) -> bool:
     return folder == "undated" or (isinstance(folder, str) and _FOLDER.fullmatch(folder) is not None)
 
 
+def folder_of(taken: str | None) -> str:
+    """The originals/ folder of an item taken at a wall-clock `YYYY-MM-DDTHH:MM:SS`."""
+    month = f"{(taken or '')[:4]}/{(taken or '')[5:7]}"
+    return month if valid_folder(month) else "undated"
+
+
 def valid_id(item_id: object) -> TypeGuard[str]:
     return isinstance(item_id, str) and _ID.fullmatch(item_id) is not None
 

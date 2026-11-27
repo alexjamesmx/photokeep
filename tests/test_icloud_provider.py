@@ -1,3 +1,4 @@
+from photokeep.metadata import derive, provider_record
 from photokeep.providers import icloud
 
 HEADER = "imgName,fileChecksum,favorite,hidden,deleted,originalCreationDate,viewCount\n"
@@ -18,10 +19,11 @@ def test_reads_details_flags_and_date(tmp_path):
     out = icloud.read(tmp_path)
     assert set(out) == {"part1/Photos/a.jpg", "part1/Photos/b.jpg", "part2/Photos/c.jpg"}
     a = out["part1/Photos/a.jpg"]
-    assert (a["originalCreationDate"], a["favorite"], a["hidden"]) == ("2024-01-04T17:34:00Z", True, False)
+    assert set(a) == set(provider_record())
+    assert (a["taken"], a["favorite"], a["hidden"]) == ("2024-01-04T17:34:00Z", True, False)
     assert out["part1/Photos/b.jpg"]["hidden"] is True
     assert a["raw"]["fileChecksum"] == "abc"
-    assert out["part2/Photos/c.jpg"]["originalCreationDate"] is None
+    assert out["part2/Photos/c.jpg"]["taken"] is None
 
 
 def test_albums_memories_and_merged_titles(tmp_path):
@@ -46,5 +48,12 @@ def test_damaged_export_gives_what_it_can(tmp_path):
     (tmp_path / "part2/Photos/Photo Details-1.csv").write_bytes(b"imgName\n\xff\xfe\n")
     out = icloud.read(tmp_path)
     assert set(out) == {"part1/Photos/a.jpg", "part1/Photos/b.jpg"}
-    assert out["part1/Photos/b.jpg"]["originalCreationDate"] is None
+    assert out["part1/Photos/b.jpg"]["taken"] is None
     assert out["part1/Photos/a.jpg"]["albums"] == ["Trip"]
+
+
+def test_migrated_photo_shows_the_date_it_showed_before(tmp_path, mexico):
+    # A photo whose only date is in Photo Details, read the way the viewer reads the migrated library.
+    write(tmp_path / "part1/Photos/Photo Details.csv", HEADER + row("a.jpg"))
+    m = derive({}, icloud.read(tmp_path)["part1/Photos/a.jpg"], "a.jpg", None)
+    assert (m["taken"], m["tz"], m["date_src"]) == ("2024-01-04T11:34:00", "-06:00", "provider")

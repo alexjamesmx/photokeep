@@ -24,6 +24,7 @@ _FIELDS: dict[str, tuple[str, ...]] = {
 OPS = frozenset(_FIELDS)
 _KEYS = ("ts", "copy", "id", "op")  # every reader sorts and folds by these
 _FILE_KEYS = ("role", "name", "sha256")
+_LINKS = ("version_of", "edit_of")  # optional ids of the item an import is another version, or an edit, of
 _ID = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 8192
 
@@ -123,7 +124,8 @@ def _valid_import(e: dict) -> bool:
     return (_ID.fullmatch(e["item"]) is not None and len(mains) == 1 and mains[0]["sha256"] == e["item"]
             # fold turns the fingerprint into a dict key, so it must hold plain values only
             and (fingerprint is None or isinstance(fingerprint, list)
-                 and not any(isinstance(x, list | dict) for x in fingerprint)))
+                 and not any(isinstance(x, list | dict) for x in fingerprint))
+            and all(e.get(k) is None or isinstance(e[k], str) and _ID.fullmatch(e[k]) is not None for k in _LINKS))
 
 
 def _valid_fields(e: dict) -> bool:
