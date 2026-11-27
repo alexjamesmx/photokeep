@@ -15,10 +15,9 @@ class HashCache:
 
     def __init__(self, lib: Library):
         self.root = lib.root
-        lib.cache.mkdir(exist_ok=True)  # cache/ is safe to delete, so it may be gone
         # Autocommit keeps each write lock short, so a long scan never blocks another process;
         # WAL + NORMAL makes those commits cheap. A cache may lose its last rows on power loss.
-        self.db = sqlite3.connect(lib.cache / "files.sqlite", isolation_level=None)
+        self.db = sqlite3.connect(lib.cache_dir() / "files.sqlite", isolation_level=None)
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS files"

@@ -6,15 +6,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from photokeep import events
-
-try:
-    import fcntl
-except ImportError:  # Windows: no flock, so a second writer is not stopped (best effort)
-    fcntl = None  # type: ignore[assignment]
+from photokeep import events, locks
 
 FORMAT_VERSION = 1
 SUBDIRS = ("originals", "sources", "log", "trash", "cache", "app")
+# Allowed to be missing: cache/ is safe to delete, and an app update cut off mid-swap leaves no app/
+# until `sync --update-app` puts it back.
+_MAY_BE_MISSING = ("cache", "app")
 
 
 class LibraryError(Exception):
@@ -55,6 +53,25 @@ class Library:
     def log_path(self, copy_id: str | None = None) -> Path:
         return self.log_dir / f"{copy_id or self.copy_id}.jsonl"
 
+    def cache_dir(self) -> Path:
+        """cache/, recreated if it was deleted."""
+        _check_folder(self.cache, may_be_missing=True)
+        self.cache.mkdir(exist_ok=True)
+        return self.cache
+
+
+def _check_folder(path: Path, may_be_missing: bool = False) -> None:
+    # A library folder that is a symlink would send writes and deletes wherever it points.
+    if path.is_symlink():
+        raise LibraryError(f"{path} is a symlink; a library folder must be a real folder")
+    if not path.is_dir() and not (may_be_missing and not path.exists()):
+        raise LibraryError(f"{path} is not a folder")
+
+
+def _check_folders(root: Path) -> None:
+    for name in SUBDIRS:
+        _check_folder(root / name, may_be_missing=name in _MAY_BE_MISSING)
+
 
 def _write_json(path: Path, data: dict) -> None:
     # Temp file + rename so a crash never leaves a half-written file.
@@ -73,6 +90,7 @@ def _prepare(root: Path) -> None:
     root.mkdir(parents=True, exist_ok=True)
     for d in SUBDIRS:
         (root / d).mkdir()
+    _check_folders(root)
 
 
 def _create(root: Path, name: str, library_id: str, created: str | None = None) -> Library:
@@ -111,6 +129,7 @@ def open_library(root: Path) -> Library:
             f"{root} uses library format {info['format']}, newer than supported {FORMAT_VERSION}; update Photokeep"
         )
     copy = _read_json(root / "copy.json")
+    _check_folders(root)
     try:
         return Library(root, info["library_id"], copy["copy_id"], copy["name"])
     except KeyError as e:
@@ -120,14 +139,10 @@ def open_library(root: Path) -> Library:
 @contextmanager
 def locked(lib: Library) -> Iterator[None]:
     """Hold the copy's exclusive lock for changing its files; fail at once if another process holds it."""
-    if fcntl is None:
-        yield
-        return
-    lib.cache.mkdir(exist_ok=True)  # cache/ is safe to delete, so it may be gone
-    fd = os.open(lib.cache / "lock", os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(lib.cache_dir() / "lock", os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            locks.flock(fd, wait=False)
         except BlockingIOError:
             raise LibraryError(f"{lib.root} is busy (another sync or the viewer is changing files)") from None
         yield

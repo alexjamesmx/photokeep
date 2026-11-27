@@ -2,7 +2,7 @@ import os
 
 import pytest
 
-from photokeep.fsops import CopyError, LayoutPlan, apply_layout, copy_verified, plan_layout, scan
+from photokeep.fsops import CopyError, HashMismatch, LayoutPlan, apply_layout, copy_verified, plan_layout, scan
 from photokeep.hashcache import HashCache
 from photokeep.state import fold
 from tests.helpers import T1, T2, T3, ev, imp, put, sha, state_with
@@ -167,7 +167,7 @@ def test_plan_paths_outside_the_library_are_not_applied(lib, jpeg):
 def test_copy_verified_leaves_no_partial_on_mismatch(tmp_path):
     src = tmp_path / "s"
     src.write_bytes(b"abc")
-    with pytest.raises(CopyError):
+    with pytest.raises(HashMismatch):
         copy_verified(src, tmp_path / "d", "0" * 64)
     assert not (tmp_path / "d").exists() and not (tmp_path / "d.photokeep-part").exists()
 
@@ -254,3 +254,16 @@ def test_hash_cache_rehashes_only_when_size_or_mtime_changes(lib):
         path.write_bytes(b"cccc")
         assert cache.sha(path) == sha(b"cccc")
     assert (lib.cache / "files.sqlite").is_file()
+
+
+def test_symlinked_originals_folder_is_never_written(lib, jpeg, tmp_path):
+    elsewhere = tmp_path / "elsewhere"
+    lib.originals.rename(elsewhere)
+    lib.originals.symlink_to(elsewhere)
+    put(lib, "originals/2024/01/A.JPG", jpeg)
+    (elsewhere / "empty").mkdir()
+    plan = plan_layout(lib, state_with(lib, jpeg, name="A.JPG", trashed=True), scan(lib))
+    assert plan.moves == [("originals/2024/01/A.JPG", f"trash/{sha(jpeg)}/A.JPG")]
+    apply_layout(lib, plan)
+    assert (elsewhere / "2024/01/A.JPG").read_bytes() == jpeg and (elsewhere / "empty").is_dir()
+    assert list(lib.trash.iterdir()) == []

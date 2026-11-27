@@ -1,8 +1,12 @@
+import errno
+import json
 import multiprocessing
+import os
+import re
 
 import pytest
 
-from photokeep.events import LogCorrupt, append, new_event, read_all, read_log
+from photokeep.events import LogCorrupt, append, new_event, parse_log, read_all, read_log
 from photokeep.library import init_copy, init_library, open_library
 
 
@@ -73,3 +77,56 @@ def test_read_all_orders_by_ts_copy_id_across_copies(lib, tmp_path):
 
 def test_read_log_missing_file_is_empty(lib, tmp_path):
     assert read_log(tmp_path / "nope.jsonl") == []
+
+
+@pytest.mark.parametrize("code", [errno.ENOTSUP, errno.ENOLCK, errno.EINVAL])
+def test_append_works_where_the_filesystem_has_no_locks(lib, monkeypatch, code):
+    fcntl = pytest.importorskip("fcntl")
+
+    def unsupported(fd, flags):
+        raise OSError(code, os.strerror(code))
+
+    monkeypatch.setattr(fcntl, "flock", unsupported)
+    append(lib, [new_event(lib, "favorite", item="e" * 64)])
+    assert read_log(lib.log_path())[-1]["op"] == "favorite"
+
+
+ITEM = "a" * 64
+FILE = {"role": "main", "name": "A.JPG", "sha256": ITEM}
+IMPORT = {"op": "import", "item": ITEM, "folder": "2024/01", "import": "i", "files": [FILE], "fingerprint": None}
+
+
+@pytest.mark.parametrize("fields", [
+    {"op": "future.thing"},
+    {"op": "copy.name", "name": "drive"},
+    IMPORT,
+    IMPORT | {"fingerprint": ["2024-01-01T00:00:00", "Camera", 8, 8]},
+    {"op": "favorite", "item": ITEM},
+    {"op": "album.add", "item": ITEM, "kind": "user", "album": "Trip"},
+    {"op": "album.rename", "kind": "user", "album": "Trip", "to": "Trip 2"},
+])
+def test_well_formed_events_parse(fields):
+    line = json.dumps({"v": 1, "id": "x", "ts": "t", "copy": "c"} | fields).encode() + b"\n"
+    assert parse_log(line, "c.jsonl")[0]["op"] == fields["op"]
+
+
+@pytest.mark.parametrize("fields", [
+    {k: v for k, v in IMPORT.items() if k != "files"},
+    IMPORT | {"files": []},
+    IMPORT | {"files": [{"role": "main", "name": "A.JPG"}]},
+    IMPORT | {"files": ["A.JPG"]},
+    IMPORT | {"item": "not-a-sha"},
+    IMPORT | {"folder": 2024},
+    IMPORT | {"fingerprint": [["nested"]]},
+    {"op": "trash"},
+    {"op": "purge", "item": 7},
+    {"op": "copy.name"},
+    {"op": "album.add", "item": ITEM, "album": "Trip"},
+    {"op": "album.remove", "kind": "user", "album": "Trip"},
+    {"op": "album.rename", "kind": "user", "album": "Trip"},
+    {"op": "future.thing", "item": ["unhashable"]},
+])
+def test_known_op_without_its_fields_is_corrupt(fields):
+    line = json.dumps({"v": 1, "id": "x", "ts": "t", "copy": "c"} | fields).encode() + b"\n"
+    with pytest.raises(LogCorrupt, match=rf"c\.jsonl: line 1 is not a valid {re.escape(fields['op'])} event"):
+        parse_log(line, "c.jsonl")

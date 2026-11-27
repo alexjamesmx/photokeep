@@ -1,23 +1,29 @@
 import json
 import os
+import re
 import uuid
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-try:
-    import fcntl
-except ImportError:  # Windows: appends are unlocked, best effort
-    fcntl = None
+from photokeep import locks
 
 if TYPE_CHECKING:
     from photokeep.library import Library
 
-OPS = frozenset({
-    "copy.name", "import", "favorite", "unfavorite", "hide", "unhide",
-    "album.add", "album.remove", "album.rename", "trash", "restore", "purge", "readmit",
-})
+# The string fields fold reads from each known op; a line without them would break every copy it reaches.
+_FIELDS: dict[str, tuple[str, ...]] = {
+    "copy.name": ("name",),
+    "import": ("item", "folder", "import"),
+    **dict.fromkeys(("favorite", "unfavorite", "hide", "unhide", "trash", "restore", "purge", "readmit"), ("item",)),
+    **dict.fromkeys(("album.add", "album.remove"), ("item", "kind", "album")),
+    "album.rename": ("kind", "album", "to"),
+}
+OPS = frozenset(_FIELDS)
+_KEYS = ("ts", "copy", "id", "op")  # every reader sorts and folds by these
+_FILE_KEYS = ("role", "name", "sha256")
+_ID = re.compile(r"[0-9a-f]{64}")
 _CHUNK = 8192
 
 
@@ -69,8 +75,7 @@ def append_lines(path: Path, data: bytes, at: int | None = None) -> None:
     # A log on another drive may be a planted symlink; appending through it would write outside the library.
     fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o644)
     try:
-        if fcntl:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        locks.flock(fd)
         _drop_torn_tail(fd)
         if at is not None and os.fstat(fd).st_size != at:
             raise LogCorrupt(f"{path.name} changed while sync was copying it; run sync again")
@@ -84,6 +89,27 @@ def append(lib: "Library", events: Iterable[dict]) -> None:
     append_lines(lib.log_path(), encode(events))
 
 
+def _strings(d: dict, keys: Iterable[str]) -> bool:
+    return all(isinstance(d.get(k), str) for k in keys)
+
+
+def _valid_import(e: dict) -> bool:
+    files, fingerprint = e.get("files"), e.get("fingerprint")
+    return (_ID.fullmatch(e["item"]) is not None
+            and isinstance(files, list) and len(files) > 0
+            and all(isinstance(f, dict) and _strings(f, _FILE_KEYS) for f in files)
+            # fold turns the fingerprint into a dict key, so it must hold plain values only
+            and (fingerprint is None or isinstance(fingerprint, list)
+                 and not any(isinstance(x, list | dict) for x in fingerprint)))
+
+
+def _valid_fields(e: dict) -> bool:
+    # fold looks up every event's item, known op or not, so it must be hashable
+    if "item" in e and not isinstance(e["item"], str):
+        return False
+    return _strings(e, _FIELDS.get(e["op"], ())) and (e["op"] != "import" or _valid_import(e))
+
+
 def parse_log(raw: bytes, name: str) -> list[dict]:
     """The events in a log's bytes; a torn final line (crash mid-append) is not part of the log."""
     *lines, _torn = raw.split(b"\n")
@@ -93,9 +119,10 @@ def parse_log(raw: bytes, name: str) -> list[dict]:
             e = json.loads(line)
         except ValueError:
             e = None
-        # Every reader sorts and folds by these keys; an event without them must stop here, not spread.
-        if not isinstance(e, dict) or not all(isinstance(e.get(k), str) for k in ("ts", "copy", "id", "op")):
+        if not isinstance(e, dict) or not _strings(e, _KEYS):
             raise LogCorrupt(f"{name}: line {n} is not a valid event")
+        if not _valid_fields(e):
+            raise LogCorrupt(f"{name}: line {n} is not a valid {e['op']} event")
         events.append(e)
     return events
 

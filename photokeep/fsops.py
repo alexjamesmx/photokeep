@@ -18,6 +18,10 @@ class CopyError(Exception):
     pass
 
 
+class HashMismatch(CopyError):
+    """The source's bytes are not the ones expected: a bad source, not a failing destination."""
+
+
 def _refuse_existing(dst: Path) -> None:
     if os.path.lexists(dst):
         raise CopyError(f"{dst} already exists")
@@ -39,7 +43,7 @@ def copy_verified(src: Path, dst: Path, sha: str) -> None:
             fout.flush()
             os.fsync(fout.fileno())
         if digest.hexdigest() != sha:
-            raise CopyError(f"{src}: SHA-256 is {digest.hexdigest()}, expected {sha}")
+            raise HashMismatch(f"{src}: SHA-256 is {digest.hexdigest()}, expected {sha}")
         _refuse_existing(dst)  # a long copy leaves time for something else to create dst
         os.replace(part, dst)
     finally:
@@ -157,9 +161,11 @@ def _remove_empty_folders(top: Path) -> None:
 
 
 def inside(lib: Library, path: Path) -> bool:
-    """True when path, with symlinks resolved, lies under lib's originals/ or trash/."""
+    """True when path, with symlinks resolved, lies under lib's real originals/ or trash/."""
     # Paths derive from other copies' logs and folders: file changes act only inside these two.
-    return any(path.resolve().is_relative_to(top.resolve()) for top in (lib.originals, lib.trash))
+    # The two are not resolved themselves, so a symlinked originals/ or trash/ counts as outside.
+    root = lib.root.resolve()
+    return any(path.resolve().is_relative_to(root / top) for top in ("originals", "trash"))
 
 
 def apply_layout(lib: Library, plan: LayoutPlan) -> None:
@@ -179,4 +185,5 @@ def apply_layout(lib: Library, plan: LayoutPlan) -> None:
                 os.replace(source, target)
                 cache.move(source, target)
     for top in (lib.originals, lib.trash):
-        _remove_empty_folders(top)
+        if not top.is_symlink():  # its empty folders would be someone else's
+            _remove_empty_folders(top)

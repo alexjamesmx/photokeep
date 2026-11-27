@@ -47,21 +47,40 @@ def _sync_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("a", type=Path, help="a copy of the library")
     p.add_argument("b", type=Path, help="another copy of the same library")
     p.add_argument("--yes", action="store_true", help="carry out the sync; without it only the plan is shown")
+    p.add_argument("--update-app", action="store_true", help="with --yes, also copy the newer app/ over the older")
 
 
 def _counts(counts: dict[str, int]) -> str:
     return ", ".join(f"{n} {what}" for what, n in counts.items())
 
 
-def _sync_text(s: dict, dry_run: bool) -> str:
+def _some(names: list[str], shown: int = 3) -> str:
+    """A count, then the first few names; the full list is in --json."""
+    if not names:
+        return "0"
+    return f"{len(names)} ({', '.join(names[:shown])}{', ...' if len(names) > shown else ''})"
+
+
+def _app_text(app: dict, dry_run: bool, update_app: bool) -> str:
+    text, way = f"app: a {app['a'] or 'none'}, b {app['b'] or 'none'}", app["direction"]
+    if not way:
+        return text
+    if not update_app:
+        return f"{text}; add --update-app to copy {way}"
+    return f"{text}; --yes copies {way}" if dry_run else f"{text}; copied {way}"
+
+
+def _sync_text(s: dict, dry_run: bool, update_app: bool) -> str:
+    bad = [f"{b['side']}:{b['path']}" for b in s["bad_sources"]]
     lines = [
         f"logs: {len(s['logs'])} files, {sum(size for *_, size in s['logs'])} bytes",
         f"files: {s['copy_a_to_b']} a->b, {s['copy_b_to_a']} b->a",
-        f"purges: {s['new_purges']}",
+        f"purges: {_some([p['item'][:12] for p in s['new_purges']])}",
         f"layout a: {_counts(s['layout_a'])}",
         f"layout b: {_counts(s['layout_b'])}",
         f"missing on both: {s['missing_both']}",
-        f"app: {s['app'] or 'no update'}",
+        f"bad sources: {_some(bad)}",
+        _app_text(s["app"], dry_run, update_app),
         f"conflicts: {s['conflicts']}",
     ]
     if s["pending"]:
@@ -75,13 +94,15 @@ def cmd_sync(args: argparse.Namespace) -> int:
     """Sync two copies both ways (shows the plan only, unless --yes)."""
     try:
         a, b = open_library(args.a), open_library(args.b)
-        result = (sync.run if args.yes else sync.plan)(a, b, datetime.now(UTC))
+        now = datetime.now(UTC)
+        result = sync.run(a, b, now, update_app=args.update_app) if args.yes else sync.plan(a, b, now)
     except (LibraryError, LogCorrupt, CopyError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
     summary = result.summary()
-    print(json.dumps(summary) if args.json else _sync_text(summary, dry_run=not args.yes))
-    return 2 if summary["conflicts"] else 0
+    print(json.dumps(summary) if args.json else _sync_text(summary, not args.yes, args.update_app))
+    # Exit 2: sync finished, but the copies could not be made whole and the owner has to look.
+    return 2 if summary["conflicts"] or summary["missing_both"] or summary["bad_sources"] else 0
 
 
 COMMANDS["sync"] = cmd_sync

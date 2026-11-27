@@ -1,20 +1,22 @@
 import json
+import os
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from photokeep import fsops, hashcache
+from photokeep import events, fsops, hashcache
 from photokeep.cli import main
 from photokeep.events import LogCorrupt, append_lines, read_all, read_log, ts_str
 from photokeep.fsops import CopyError
 from photokeep.library import Library, LibraryError, init_library, locked, open_library
 from photokeep.state import fold
 from photokeep.sync import exchange_logs, plan, run
-from tests.helpers import T0, T1, T2, add_item, fail_after, files_of, mark, no_part_files, put, snapshot
+from tests.helpers import T0, T1, T2, add_item, fail_after, files_of, imp, mark, no_part_files, put, sha, snapshot
 
 NOW = datetime(2026, 1, 2, tzinfo=UTC)
 TRASHED = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)  # T1, when mark() trashes
 CLEAN = {"moves": 0, "deletes": 0, "missing": 0, "untracked": 0, "conflicts": 0}
+NO_APP = {"direction": None, "a": None, "b": None}
 
 
 def logs_of(lib: Library) -> dict[str, bytes]:
@@ -79,7 +81,7 @@ def test_purge_after_30_days_deletes_everywhere(a, b):
     assert run(a, b, TRASHED + timedelta(days=29)).new_purges == []
     assert files_of(a) == files_of(b) == {f"trash/{x}/A.JPG": b"photo"}
     later = TRASHED + timedelta(days=31)
-    assert run(a, b, later).new_purges == [x]
+    assert run(a, b, later).new_purges == [(x, T1)]
     assert files_of(a) == files_of(b) == {}
     [purge] = [e for e in read_log(a.log_path()) if e["op"] == "purge"]
     assert purge["item"] == x and purge["ts"] == ts_str(later)
@@ -122,6 +124,16 @@ def test_invalid_line_is_never_copied(a, b):
         f.write(b'{"v":1,"op":"favorite"}\n')
     before = snapshot(a, b)
     with pytest.raises(LogCorrupt, match=a.copy_id):
+        run(a, b, NOW)
+    assert snapshot(a, b) == before
+
+
+def test_known_op_missing_its_fields_is_never_copied(a, b):
+    bad = imp(sha(b"x"), copy=a.copy_id)
+    del bad["files"]
+    events.append(a, [bad])
+    before = snapshot(a, b)
+    with pytest.raises(LogCorrupt, match=rf"{a.copy_id}\.jsonl: line 2 is not a valid import event"):
         run(a, b, NOW)
     assert snapshot(a, b) == before
 
@@ -190,10 +202,11 @@ def test_dry_run_plan_writes_nothing(a, b):
     before = snapshot(a, b)
     s = plan(a, b, now).summary()
     assert snapshot(a, b) == before
-    assert (s["new_purges"], s["copy_a_to_b"], s["copy_b_to_a"], s["missing_both"], s["conflicts"]) == (1, 1, 1, 0, 0)
+    assert s["new_purges"] == [{"item": old, "trashed_at": T1}]
+    assert (s["copy_a_to_b"], s["copy_b_to_a"], s["missing_both"], s["conflicts"], s["bad_sources"]) == (1, 1, 0, 0, [])
     assert [(f, d) for f, d, _ in s["logs"]] == sorted([(f"{a.copy_id}.jsonl", "a->b"), (f"{b.copy_id}.jsonl", "b->a")])
     assert s["layout_a"] == CLEAN | {"deletes": 1, "missing": 1} and s["layout_b"] == CLEAN | {"missing": 1}
-    assert s["app"] is None and s["pending"] is None
+    assert s["app"] == NO_APP and s["pending"] is None
     assert run(a, b, now).summary() == s | {"pending": {"a": CLEAN, "b": CLEAN}}
 
 
@@ -218,37 +231,74 @@ def test_file_missing_on_both_sides_is_reported(a, b):
     (a.originals / "2024/01/IMG_1.JPG").unlink()
     result = run(a, b, NOW)
     assert result.missing_both == [(x, "originals/2024/01/IMG_1.JPG")] and result.summary()["missing_both"] == 1
+    assert main(["sync", str(a.root), str(b.root), "--yes"]) == 2
 
 
-def test_newer_app_copied_to_older_side(a, b):
+def test_rotted_source_is_skipped_and_listed_while_the_rest_is_copied(a, b):
+    rotten = add_item(a, b"rots later", name="A.JPG")
+    add_item(a, b"stays good", name="B.JPG")
+    plan(a, b, NOW)  # a's hash cache now vouches for A.JPG
+    path = a.originals / "2024/01/A.JPG"
+    st = path.stat()
+    path.write_bytes(b"R" + b"rots later"[1:])
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+    s = run(a, b, NOW).summary()
+    assert s["bad_sources"] == [{"side": "a", "path": "originals/2024/01/A.JPG", "sha": rotten}]
+    assert files_of(b) == {"originals/2024/01/B.JPG": b"stays good"} and no_part_files(b)
+    assert main(["sync", str(a.root), str(b.root), "--yes"]) == 2
+
+
+def test_app_is_never_replaced_without_the_flag(a, b):
+    put(a, "app/photokeep/__init__.py", b'__version__ = "0.10.0"\n')
+    put(b, "app/photokeep/__init__.py", b'__version__ = "0.9.1"\n')
+    before = app_files(b)
+    assert run(a, b, NOW).summary()["app"] == {"direction": "a->b", "a": "0.10.0", "b": "0.9.1"}
+    assert app_files(b) == before
+
+
+def test_newer_app_copied_to_older_side_with_the_flag(a, b):
     put(a, "app/photokeep/__init__.py", b'__version__ = "0.10.0"\n')
     put(a, "app/photokeep/new.py", b"new")
     put(b, "app/photokeep/__init__.py", b'__version__ = "0.9.1"\n')
     put(b, "app/photokeep/stale.py", b"old")
-    assert plan(a, b, NOW).app == "a->b"
-    assert run(a, b, NOW).app == "a->b"
+    assert plan(a, b, NOW).app.direction == "a->b"
+    assert run(a, b, NOW, update_app=True).app.direction == "a->b"
     assert app_files(b) == app_files(a) == {"photokeep/__init__.py": b'__version__ = "0.10.0"\n',
                                             "photokeep/new.py": b"new"}
-    assert run(a, b, NOW).app is None
+    assert run(a, b, NOW, update_app=True).summary()["app"] == {"direction": None, "a": "0.10.0", "b": "0.10.0"}
     put(b, "app/photokeep/__init__.py", b'__version__ = "0.11"\n')
-    assert run(a, b, NOW).app == "b->a" and app_files(a) == app_files(b)
+    assert run(a, b, NOW, update_app=True).app.direction == "b->a" and app_files(a) == app_files(b)
     assert [p for p in (*a.cache.iterdir(), *b.cache.iterdir()) if p.is_dir()] == []
+
+
+def test_app_containing_a_symlink_is_refused_before_anything_changes(a, b, tmp_path):
+    put(a, "app/photokeep/__init__.py", b'__version__ = "0.2.0"\n')
+    (tmp_path / "anywhere.py").write_bytes(b"code from elsewhere")
+    (a.app / "photokeep" / "evil.py").symlink_to(tmp_path / "anywhere.py")
+    put(b, "app/photokeep/__init__.py", b'__version__ = "0.1.0"\n')
+    add_item(a, b"photo")
+    before = snapshot(a, b)
+    with pytest.raises(LibraryError, match="symlink"):
+        run(a, b, NOW, update_app=True)
+    assert snapshot(a, b) == before
 
 
 def test_app_update_skipped_when_absent_or_equal(a, b):
     put(a, "app/photokeep/__init__.py", b'__version__ = "0.2.0"\n')
-    assert run(a, b, NOW).app is None and app_files(b) == {}
+    assert run(a, b, NOW, update_app=True).app.direction is None and app_files(b) == {}
     put(b, "app/photokeep/__init__.py", b'__version__ = "0.2.0"\n')
     put(b, "app/photokeep/x.py", b"x")
-    assert run(a, b, NOW).app is None and "photokeep/x.py" not in app_files(a)
+    assert run(a, b, NOW, update_app=True).app.direction is None and "photokeep/x.py" not in app_files(a)
 
 
 def test_app_swap_cut_off_between_renames_is_finished_by_the_next_run(a, b):
     put(a, "app/photokeep/__init__.py", b'__version__ = "0.2.0"\n')
     put(b, "app/photokeep/__init__.py", b'__version__ = "0.1.0"\n')
-    (b.cache / "app-update").mkdir()
-    b.app.rename(b.cache / "app-update" / "old")
-    assert run(a, b, NOW).app == "a->b" and app_files(b) == app_files(a)
+    (b.cache / "app-update-crashed").mkdir()
+    b.app.rename(b.cache / "app-update-crashed" / "old")
+    open_library(b.root)  # a missing app/ must not lock the owner out of the repair
+    assert run(a, b, NOW, update_app=True).app.direction == "a->b" and app_files(b) == app_files(a)
+    assert not (b.cache / "app-update-crashed").exists()
 
 
 def test_copy_never_writes_through_a_symlinked_folder(a, b, tmp_path):
@@ -298,6 +348,20 @@ def test_cli_sync_exits_2_on_conflict(a, b, capsys):
     assert main(["sync", str(a.root), str(b.root)]) == 2
     assert main(["sync", str(a.root), str(b.root), "--yes", "--json"]) == 2
     assert json.loads(capsys.readouterr().out.splitlines()[-1])["conflicts"] == 1
+
+
+def test_cli_lists_due_purges_and_updates_the_app_only_when_asked(a, b, capsys):
+    old = add_item(a, b"old", name="O.JPG")
+    mark(a, "trash", old)
+    put(a, "app/photokeep/__init__.py", b'__version__ = "0.2.0"\n')
+    put(b, "app/photokeep/__init__.py", b'__version__ = "0.1.0"\n')
+    assert main(["sync", str(a.root), str(b.root)]) == 0
+    out = capsys.readouterr().out
+    assert f"purges: 1 ({old[:12]})" in out and "--update-app" in out
+    assert main(["sync", str(a.root), str(b.root), "--yes"]) == 0
+    assert app_files(b) == {"photokeep/__init__.py": b'__version__ = "0.1.0"\n'}
+    assert main(["sync", str(a.root), str(b.root), "--yes", "--update-app", "--json"]) == 0
+    assert app_files(b) == app_files(a)
 
 
 def test_cli_sync_reports_errors(tmp_path, capsys):

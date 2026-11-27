@@ -1,9 +1,11 @@
-"""Two-way sync of two copies of one library: logs, then files, then the app."""
+"""Two-way sync of two copies of one library: logs, then files, then (only when asked) the app."""
 import os
 import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import NamedTuple
 
 from photokeep import events, fsops
@@ -14,36 +16,59 @@ from photokeep.library import Library, LibraryError, locked
 from photokeep.state import State, fold
 
 _VERSION = re.compile(r"""^__version__\s*=\s*["']([0-9]+(?:\.[0-9]+)*)["']""", re.MULTILINE)
+_APP_WORK = "app-update-"  # prefix of the app update's work folders under cache/
 
 Found = dict[str, list[str]]  # what scan returns: sha -> paths
 Files = list[tuple[str, str]]  # (sha, expected path)
 
 
+def _version_key(version: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in version.split("."))
+
+
+@dataclass(frozen=True)
+class AppUpdate:
+    a: str | None  # __version__ of each copy's app/, None when it has none
+    b: str | None
+
+    @property
+    def direction(self) -> str | None:
+        """Which way the newer app would be copied; None when either copy has none or both match."""
+        if self.a is None or self.b is None or _version_key(self.a) == _version_key(self.b):
+            return None
+        return "a->b" if _version_key(self.a) > _version_key(self.b) else "b->a"
+
+    def to_json(self) -> dict:
+        return {"direction": self.direction, "a": self.a, "b": self.b}
+
+
 @dataclass
 class SyncPlan:
     logs: list[tuple[str, str, int]]  # (log file, "a->b" | "b->a", bytes)
-    new_purges: list[str]  # item ids whose 30 days in the trash are over
+    new_purges: list[tuple[str, str | None]]  # (item, trashed at) for items whose 30 days in the trash are over
     copy_a_to_b: Files  # filled on b from a
     copy_b_to_a: Files
     layout_a: LayoutPlan
     layout_b: LayoutPlan
-    app: str | None  # which way app/ is copied, if at all
+    app: AppUpdate  # copied only by run(update_app=True)
     missing_both: Files = field(default_factory=list)  # expected on both, held by neither
     pending: tuple[LayoutPlan, LayoutPlan] | None = None  # after a run: what a fresh plan of each side still finds
+    bad_sources: list[tuple[str, str, str]] = field(default_factory=list)  # (side, path, expected sha), skipped
 
     def summary(self) -> dict:
         # Conflicts are counted where they stand last: after a run, in the fresh plans.
         final = self.pending or (self.layout_a, self.layout_b)
         return {
             "logs": [list(t) for t in self.logs],
-            "new_purges": len(self.new_purges),
+            "new_purges": [{"item": item, "trashed_at": ts} for item, ts in self.new_purges],
             "copy_a_to_b": len(self.copy_a_to_b),
             "copy_b_to_a": len(self.copy_b_to_a),
             "layout_a": self.layout_a.summary(),
             "layout_b": self.layout_b.summary(),
             "missing_both": len(self.missing_both),
-            "app": self.app,
+            "app": self.app.to_json(),
             "conflicts": sum(len(p.conflicts) for p in final),
+            "bad_sources": [{"side": side, "path": path, "sha": sha} for side, path, sha in self.bad_sources],
             "pending": {"a": self.pending[0].summary(), "b": self.pending[1].summary()} if self.pending else None,
         }
 
@@ -101,7 +126,7 @@ def _appends(a: Library, b: Library, logs: list[_Log]) -> list[_Append]:
             continue
         src, dst, longer, shorter, direction = (
             (a, b, log.on_a, log.on_b, "a->b") if len(log.on_a) > len(log.on_b) else (b, a, log.on_b, log.on_a, "b->a"))
-        parse_log(longer, str(src.log_dir / log.name))  # never spread a line no reader could fold
+        parse_log(longer, str(src.log_dir / log.name))  # raises on a malformed line before anything is written
         todo.append(_Append(dst, log.name, len(shorter), longer[len(shorter):], direction))
     return todo
 
@@ -119,8 +144,12 @@ def exchange_logs(a: Library, b: Library, dry_run: bool) -> list[tuple[str, str,
     return [t.report() for t in todo]
 
 
-def _purges(a: Library, state: State, now: datetime) -> list[dict]:
-    return [new_event(a, "purge", ts=ts_str(now), item=item) for item in state.due_purges(now)]
+def _due(state: State, now: datetime) -> list[tuple[str, str | None]]:
+    return [(item, state.items[item].trashed_at) for item in state.due_purges(now)]
+
+
+def _purge_events(a: Library, due: list[tuple[str, str | None]], now: datetime) -> list[dict]:
+    return [new_event(a, "purge", ts=ts_str(now), item=item) for item, _ in due]
 
 
 def _merged(logs: list[tuple[str, str, int]]) -> list[tuple[str, str, int]]:
@@ -140,20 +169,17 @@ def _fills(layouts: tuple[LayoutPlan, LayoutPlan], found: tuple[Found, Found]) -
     return a_to_b, b_to_a, neither
 
 
-def _app_version(lib: Library) -> tuple[int, ...] | None:
+def _app_version(lib: Library) -> str | None:
     try:
         text = (lib.app / "photokeep" / "__init__.py").read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return None
     m = _VERSION.search(text)
-    return tuple(int(n) for n in m.group(1).split(".")) if m else None
+    return m.group(1) if m else None
 
 
-def _app_direction(a: Library, b: Library) -> str | None:
-    va, vb = _app_version(a), _app_version(b)
-    if va is None or vb is None or va == vb:
-        return None
-    return "a->b" if va > vb else "b->a"
+def _app(a: Library, b: Library) -> AppUpdate:
+    return AppUpdate(_app_version(a), _app_version(b))
 
 
 def plan(a: Library, b: Library, now: datetime) -> SyncPlan:
@@ -162,15 +188,15 @@ def plan(a: Library, b: Library, now: datetime) -> SyncPlan:
     logs = _compare(a, b)
     transfers = [t.report() for t in _appends(a, b, logs)]
     union = [e for log in logs for e in parse_log(max(log.on_a, log.on_b, key=len), log.name)]
-    purges = _purges(a, fold(ordered(union)), now)
+    due = _due(fold(ordered(union)), now)
+    purges = _purge_events(a, due, now)
     state = fold(ordered(union + purges))
     if purges:
         transfers.append((a.log_path().name, "a->b", len(encode(purges))))
     found = scan(a, cleanup=False), scan(b, cleanup=False)
     layouts = plan_layout(a, state, found[0]), plan_layout(b, state, found[1])
     a_to_b, b_to_a, neither = _fills(layouts, found)
-    return SyncPlan(_merged(transfers), [e["item"] for e in purges], a_to_b, b_to_a, *layouts,
-                    _app_direction(a, b), neither)
+    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, _app(a, b), neither)
 
 
 def _arrange(lib: Library, state: State) -> LayoutPlan:
@@ -179,57 +205,88 @@ def _arrange(lib: Library, state: State) -> LayoutPlan:
     return layout
 
 
-def _copy(src: Library, dst: Library, found: Found, todo: Files) -> None:
+def _copy(src: Library, dst: Library, side: str, found: Found, todo: Files) -> list[tuple[str, str, str]]:
+    """Fill dst's missing files from src; return the sources skipped because their bytes are not the expected ones."""
+    bad = []
     with HashCache(dst) as cache:
         for sha, rel in todo:
-            target = dst.root / rel
-            if inside(dst, target):
-                fsops.copy_verified(src.root / found[sha][0], target, sha)
-                cache.record(target, sha)  # verified while copying: the next scan need not read it again
+            source, target = found[sha][0], dst.root / rel
+            if not inside(dst, target):
+                continue
+            try:
+                fsops.copy_verified(src.root / source, target, sha)
+            except fsops.HashMismatch:  # rotted source: the rest is still worth copying
+                bad.append((side, source, sha))
+                continue
+            cache.record(target, sha)  # verified while copying: the next scan need not read it again
+    return bad
+
+
+def _refuse_links(top: Path) -> None:
+    """Raise unless top holds only plain folders and files: a symlink in an app could run code from anywhere."""
+    paths = [top] + [Path(folder) / name for folder, dirs, files in os.walk(top) for name in dirs + files]
+    for path in paths:
+        if path.is_symlink() or not (path.is_dir() or path.is_file()):
+            raise LibraryError(f"{path} is a symlink or a special file; the app is not copied")
 
 
 def _replace_app(src: Library, dst: Library) -> None:
-    work = dst.cache / "app-update"
-    shutil.rmtree(work, ignore_errors=True)
-    shutil.copytree(src.app, work / "new", symlinks=True)
-    # Two renames: a crash between them leaves no app/, which _restore_app puts back on the next run.
+    work = Path(tempfile.mkdtemp(prefix=_APP_WORK, dir=dst.cache_dir()))
+    try:
+        shutil.copytree(src.app, work / "new", symlinks=True)
+        _refuse_links(work / "new")  # src may have changed since it was checked
+    except BaseException:
+        shutil.rmtree(work)
+        raise
     os.replace(dst.app, work / "old")
-    os.replace(work / "new", dst.app)
+    os.replace(work / "new", dst.app)  # a crash between the two renames leaves old/ for _restore_app
     shutil.rmtree(work)
 
 
 def _restore_app(lib: Library) -> None:
-    old = lib.cache / "app-update" / "old"
-    if not lib.app.exists() and old.is_dir():
-        os.replace(old, lib.app)
+    """Clear up after an app update that was cut off: put app/ back if it is gone, then drop the work folders."""
+    for work in sorted(lib.cache_dir().glob(_APP_WORK + "*")):
+        if work.is_symlink() or not work.is_dir():
+            continue
+        old = work / "old"
+        if not os.path.lexists(lib.app) and old.is_dir() and not old.is_symlink():
+            os.replace(old, lib.app)
+        shutil.rmtree(work)
 
 
 def after_sync(lib: Library) -> None:
     """Refresh a synced copy's derived caches; none exist yet beyond the hash cache, which scan keeps current."""
 
 
-def run(a: Library, b: Library, now: datetime) -> SyncPlan:
-    """Sync both copies both ways. Every step is idempotent, so an interrupted run is finished by running again."""
+def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> SyncPlan:
+    """Sync both copies both ways; with update_app, also copy the newer app/ over the older one.
+
+    Every step is idempotent, so an interrupted run is finished by running it again.
+    """
     _check(a, b)
     with locked(a), locked(b):
+        if update_app:
+            for lib in (a, b):
+                _restore_app(lib)
+        app = _app(a, b)
+        ends = None
+        if update_app and app.direction:
+            ends = (a, b) if app.direction == "a->b" else (b, a)
+            _refuse_links(ends[0].app)  # refused before anything changes
         transfers = exchange_logs(a, b, dry_run=False)
-        purges = _purges(a, fold(read_all(a)), now)
-        events.append(a, purges)
+        due = _due(fold(read_all(a)), now)
+        events.append(a, _purge_events(a, due, now))
         transfers += exchange_logs(a, b, dry_run=False)
         state = fold(read_all(a))
         # Arrange before copying: a move on one side can free the path a copied file has to take.
         layouts = _arrange(a, state), _arrange(b, state)
         found = scan(a), scan(b)
         a_to_b, b_to_a, neither = _fills((plan_layout(a, state, found[0]), plan_layout(b, state, found[1])), found)
-        _copy(a, b, found[0], a_to_b)
-        _copy(b, a, found[1], b_to_a)
+        bad = _copy(a, b, "a", found[0], a_to_b) + _copy(b, a, "b", found[1], b_to_a)
         # apply_layout skips steps whose files changed meanwhile; fresh plans show what is left.
         pending = plan_layout(a, state, scan(a)), plan_layout(b, state, scan(b))
-        for lib in (a, b):
-            _restore_app(lib)
-        app = _app_direction(a, b)
-        if app:
-            _replace_app(*((a, b) if app == "a->b" else (b, a)))
+        if ends:
+            _replace_app(*ends)
         for lib in (a, b):
             after_sync(lib)
-    return SyncPlan(_merged(transfers), [e["item"] for e in purges], a_to_b, b_to_a, *layouts, app, neither, pending)
+    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, app, neither, pending, bad)
