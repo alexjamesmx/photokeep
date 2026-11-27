@@ -292,6 +292,14 @@ class Cache:
             self.preview_path(item_id).unlink(missing_ok=True)
         db.executemany("DELETE FROM media WHERE id = ?", [(i,) for i in gone])
 
+    def seed_media(self, measured: dict[str, dict]) -> None:
+        """Store what was measured elsewhere (the prototype library), keyed by item id, so it is not rendered again."""
+        with self._db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            with db:
+                for item_id, res in measured.items():
+                    _store(db, item_id, res)
+
     def _unrendered(self, db: sqlite3.Connection, rows: list[dict]) -> list[dict]:
         known = {i for (i,) in db.execute("SELECT id FROM media")}
         return [r for r in rows if (r["id"] not in known or not self.thumb_path(r["id"]).exists())

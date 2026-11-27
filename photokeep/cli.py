@@ -7,7 +7,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photokeep import __version__, appcopy, media, server, status, sync, verify
+from photokeep import __version__, appcopy, media, migrate_v0, server, status, sync, verify
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
@@ -251,11 +251,46 @@ def cmd_serve(args: argparse.Namespace) -> int:
     return 0
 
 
+def _migrate_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("old", type=Path, help="the prototype library (the folder holding .library/)")
+    _copy_arg(p)
+    p.add_argument("--raw", type=Path, required=True, metavar="DIR",
+                   help="the export's extracted raw/ folder (partN/...), with exif.json beside it")
+    p.add_argument("--zip", dest="zips", type=Path, nargs="+", required=True, metavar="FILE",
+                   help="the export's zips: media in them that the library no longer has is blocked")
+    p.add_argument("--dry-run", action="store_true", help="check and count only; change nothing")
+
+
+def _migrate_text(s: dict, dry_run: bool) -> str:
+    lines = [f"{what.replace('_', ' ')}: {n}" for what, n in s.items() if what != "problems"]
+    problems = [f"{p['source']}: {p['problem']}" for p in s["problems"]]
+    lines.append(f"problems: {_some(problems)}")
+    if dry_run:
+        lines.append("dry run: nothing changed; run again without --dry-run to migrate")
+    return "\n".join(lines)
+
+
+def cmd_migrate_v0(args: argparse.Namespace) -> int:
+    """Fill a new copy from the prototype library, once (copies; the prototype is never changed)."""
+    try:
+        s = migrate_v0.migrate(args.old, args.raw, args.zips, open_library(args.copy), args.dry_run,
+                               progress=lambda line: print(line, file=sys.stderr, flush=True))
+    except (LibraryError, LogCorrupt, CopyError, OSError, migrate_v0.MigrationError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        print(f"photokeep: database error ({e})", file=sys.stderr)
+        return 1
+    print(json.dumps(s) if args.json else _migrate_text(s, args.dry_run))
+    return 2 if s["problems"] else 0  # done, but some rows or zip members need the owner's look
+
+
 COMMANDS["verify"], ARGUMENTS["verify"] = cmd_verify, _verify_args
 COMMANDS["repair"], ARGUMENTS["repair"] = cmd_repair, _repair_args
 COMMANDS["status"], ARGUMENTS["status"] = cmd_status, _copy_arg
 COMMANDS["cache"], ARGUMENTS["cache"] = cmd_cache, _cache_args
 COMMANDS["serve"], ARGUMENTS["serve"] = cmd_serve, _serve_args
+COMMANDS["migrate-v0"], ARGUMENTS["migrate-v0"] = cmd_migrate_v0, _migrate_args
 
 
 def build_parser() -> argparse.ArgumentParser:
