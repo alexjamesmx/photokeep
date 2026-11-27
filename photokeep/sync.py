@@ -12,12 +12,15 @@ from photokeep import events, fsops
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt, encode, new_event, ordered, parse_log, read_all, ts_str
 from photokeep.fsops import LayoutPlan, apply_layout, inside, plan_layout, scan
-from photokeep.hashcache import HashCache
+from photokeep.hashcache import HashCache, file_sha256
 from photokeep.library import Library, LibraryError, locked
+from photokeep.paths import PART
 from photokeep.state import State, fold
 
 _VERSION = re.compile(r"""^__version__\s*=\s*["']([0-9]+(?:\.[0-9]+)*)["']""", re.MULTILINE)
 _APP_WORK = "app-update-"  # prefix of the app update's work folders under cache/
+
+_IMPORT_ID = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+-[0-9a-f]+$")
 
 Found = dict[str, list[str]]  # what scan returns: sha -> paths
 Files = list[tuple[str, str]]  # (sha, expected path)
@@ -55,6 +58,9 @@ class SyncPlan:
     missing_both: Files = field(default_factory=list)  # expected on both, held by neither
     pending: tuple[LayoutPlan, LayoutPlan] | None = None  # after a run: what a fresh plan of each side still finds
     bad_sources: list[tuple[str, str, str]] = field(default_factory=list)  # (side, path, expected sha), skipped
+    sources_a_to_b: list[str] = field(default_factory=list)  # files under sources/ filled on b from a
+    sources_b_to_a: list[str] = field(default_factory=list)
+    sources_conflicts: list[str] = field(default_factory=list)  # under sources/: different bytes, a symlink or not ours
 
     def summary(self) -> dict:
         # Conflicts are counted where they stand last: after a run, in the fresh plans.
@@ -67,6 +73,8 @@ class SyncPlan:
             "layout_a": self.layout_a.summary(),
             "layout_b": self.layout_b.summary(),
             "missing_both": len(self.missing_both),
+            "sources": {"a_to_b": len(self.sources_a_to_b), "b_to_a": len(self.sources_b_to_a),
+                        "conflicts": self.sources_conflicts},
             "app": self.app.to_json(),
             "conflicts": sum(len(p.conflicts) for p in final),
             "bad_sources": [{"side": side, "path": path, "sha": sha} for side, path, sha in self.bad_sources],
@@ -170,6 +178,51 @@ def _fills(layouts: tuple[LayoutPlan, LayoutPlan], found: tuple[Found, Found]) -
     return a_to_b, b_to_a, neither
 
 
+class _Sources(NamedTuple):
+    a_to_b: dict[str, str]  # path under sources/ -> sha of the file on a
+    b_to_a: dict[str, str]
+    conflicts: list[str]
+
+
+def _source_files(lib: Library) -> tuple[dict[str, str], set[str]]:
+    """Return (path under sources/ -> sha) of the regular files of its import folders, and the paths that are not
+    ours to copy: symlinks, special files and entries not named like an import id."""
+    files: dict[str, str] = {}
+    foreign: set[str] = set()
+    for entry in sorted(lib.sources.iterdir()):
+        if entry.is_symlink() or not entry.is_dir() or not _IMPORT_ID.match(entry.name):
+            foreign.add(entry.name)
+            continue
+        for folder, dirs, names in os.walk(entry):
+            for name in dirs + names:
+                path = Path(folder) / name
+                rel = path.relative_to(lib.sources).as_posix()
+                if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                    foreign.add(rel)
+                elif path.is_file() and not name.endswith(PART):  # a .part is an interrupted copy
+                    files[rel] = file_sha256(path)
+    return files, foreign
+
+
+def _compare_sources(a: Library, b: Library) -> _Sources:
+    """Import folders are write-once: a file on one side only is copied, differing bytes are a conflict."""
+    (files_a, foreign_a), (files_b, foreign_b) = _source_files(a), _source_files(b)
+    conflicts = foreign_a | foreign_b | {rel for rel in files_a.keys() & files_b.keys() if files_a[rel] != files_b[rel]}
+    return _Sources({rel: sha for rel, sha in sorted(files_a.items()) if rel not in files_b and rel not in conflicts},
+                    {rel: sha for rel, sha in sorted(files_b.items()) if rel not in files_a and rel not in conflicts},
+                    sorted(conflicts))
+
+
+def _copy_sources(src: Library, dst: Library, side: str, todo: dict[str, str]) -> list[tuple[str, str, str]]:
+    bad = []
+    for rel, sha in todo.items():
+        try:
+            fsops.copy_verified(src.sources / rel, dst.sources / rel, sha)
+        except fsops.HashMismatch:
+            bad.append((side, f"sources/{rel}", sha))
+    return bad
+
+
 def _app_version(lib: Library) -> str | None:
     try:
         text = (lib.app / "photokeep" / "__init__.py").read_text(encoding="utf-8")
@@ -197,7 +250,10 @@ def plan(a: Library, b: Library, now: datetime) -> SyncPlan:
     found = scan(a, cleanup=False), scan(b, cleanup=False)
     layouts = plan_layout(a, state, found[0]), plan_layout(b, state, found[1])
     a_to_b, b_to_a, neither = _fills(layouts, found)
-    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, _app(a, b), neither)
+    sources = _compare_sources(a, b)
+    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, _app(a, b), neither,
+                    sources_a_to_b=list(sources.a_to_b), sources_b_to_a=list(sources.b_to_a),
+                    sources_conflicts=sources.conflicts)
 
 
 def _arrange(lib: Library, state: State) -> LayoutPlan:
@@ -274,12 +330,14 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
         due = _due(fold(read_all(a)), now)
         events.append(a, _purge_events(a, due, now))
         transfers += exchange_logs(a, b, dry_run=False)
+        sources = _compare_sources(a, b)
+        bad = _copy_sources(a, b, "a", sources.a_to_b) + _copy_sources(b, a, "b", sources.b_to_a)
         state = fold(read_all(a))
         # Arrange before copying: a move on one side can free the path a copied file has to take.
         layouts = _arrange(a, state), _arrange(b, state)
         found = scan(a), scan(b)
         a_to_b, b_to_a, neither = _fills((plan_layout(a, state, found[0]), plan_layout(b, state, found[1])), found)
-        bad = _copy(a, b, "a", found[0], a_to_b) + _copy(b, a, "b", found[1], b_to_a)
+        bad += _copy(a, b, "a", found[0], a_to_b) + _copy(b, a, "b", found[1], b_to_a)
         # apply_layout skips steps whose files changed meanwhile; fresh plans show what is left.
         pending = plan_layout(a, state, scan(a)), plan_layout(b, state, scan(b))
         if ends:
@@ -288,4 +346,5 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
         # `photokeep cache refresh`.
         for lib in (a, b):
             Cache(lib).refresh(render=False)
-    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, app, neither, pending, bad)
+    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, app, neither, pending, bad,
+                    list(sources.a_to_b), list(sources.b_to_a), sources.conflicts)

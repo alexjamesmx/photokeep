@@ -18,6 +18,8 @@ A library is a set of equal copies. Each copy is a folder; copies converge by ex
 
 Restore moves a file back to the same place in originals/. Originals and trash files are only renamed, copied with hash verification, or deleted when their item is purged. Their bytes are never modified.
 
+Sync copies `sources/` too: each `sources/<import id>/` folder is write-once, so files are only added, and a path whose bytes differ between copies is reported as a conflict and left alone.
+
 ## JSON files
 
 - `library.json`: `{"format": 1, "library_id": "<uuid4 hex>", "created": "<utc iso>"}`. A reader refuses `format` greater than it supports.

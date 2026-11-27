@@ -12,7 +12,8 @@ from photokeep.fsops import CopyError
 from photokeep.library import Library, LibraryError, init_library, locked, open_library
 from photokeep.state import fold
 from photokeep.sync import exchange_logs, plan, run
-from tests.helpers import T0, T1, T2, add_item, fail_after, files_of, imp, mark, no_part_files, put, sha, snapshot
+from tests.helpers import (T0, T1, T2, add_item, add_source, fail_after, files_of, imp, mark, no_part_files, put, sha,
+                           snapshot)
 
 NOW = datetime(2026, 1, 2, tzinfo=UTC)
 TRASHED = datetime(2026, 1, 1, 0, 0, 1, tzinfo=UTC)  # T1, when mark() trashes
@@ -377,3 +378,96 @@ def test_cli_sync_reports_errors(tmp_path, capsys):
     a, b = init_library(tmp_path / "A", "x"), init_library(tmp_path / "B", "y")
     assert main(["sync", str(a.root), str(b.root)]) == 1
     assert "different libraries" in capsys.readouterr().err
+
+
+IMPORT = "2026-01-05-icloud-a1b2c3"
+SOURCE_FILES = ("manifest.json", "exif.json", "part1/Photos/Photo Details.csv")
+
+
+def sources_of(lib: Library) -> dict[str, bytes]:
+    return {p.relative_to(lib.sources).as_posix(): p.read_bytes() for p in lib.sources.rglob("*") if p.is_file()}
+
+
+def test_import_dir_only_on_a_is_copied_and_b_shows_the_provider_date(a, b, mexico):
+    x = add_item(a, b"photo", name="IMG_1.JPG", import_id=IMPORT)
+    add_source(a, IMPORT, {"part1/Photos/IMG_1.JPG": b"photo"}, dates={"IMG_1.JPG": "Thursday January 4,2024 5:34 PM GMT"})
+    s = run(a, b, NOW).summary()
+    assert s["sources"] == {"a_to_b": 3, "b_to_a": 0, "conflicts": []}
+    assert sources_of(b) == sources_of(a) and set(sources_of(b)) == {f"{IMPORT}/{f}" for f in SOURCE_FILES}
+    assert (Cache(b).item_json(x)["t"], Cache(b).item_json(x)["ds"]) == ("2024-01-04T11:34:00", "provider")
+    assert no_part_files(a, b)
+
+
+def test_file_only_in_bs_import_dir_is_copied_to_a(a, b):
+    add_source(a, IMPORT, {})
+    run(a, b, NOW)
+    put(b, f"sources/{IMPORT}/part2/Photo Details.csv", b"late")
+    s = run(a, b, NOW).summary()
+    assert s["sources"] == {"a_to_b": 0, "b_to_a": 1, "conflicts": []}
+    assert sources_of(a) == sources_of(b) and sources_of(a)[f"{IMPORT}/part2/Photo Details.csv"] == b"late"
+
+
+def test_same_path_with_different_bytes_is_a_conflict_and_left_alone(a, b):
+    put(a, f"sources/{IMPORT}/exif.json", b"[1]")
+    put(b, f"sources/{IMPORT}/exif.json", b"[2]")
+    before = sources_of(a), sources_of(b)
+    assert plan(a, b, NOW).summary()["sources"] == {"a_to_b": 0, "b_to_a": 0, "conflicts": [f"{IMPORT}/exif.json"]}
+    assert main(["sync", str(a.root), str(b.root), "--yes"]) == 2
+    assert (sources_of(a), sources_of(b)) == before
+
+
+def test_dry_run_writes_nothing_to_sources(a, b):
+    add_source(a, IMPORT, {"part1/Photos/IMG_1.JPG": b"x"})
+    put(b, f"sources/{IMPORT}/extra.txt", b"y")
+    before = snapshot(a, b)
+    s = plan(a, b, NOW).summary()
+    assert (s["sources"]["a_to_b"], s["sources"]["b_to_a"]) == (2, 1)
+    assert snapshot(a, b) == before
+
+
+def test_symlink_in_sources_is_skipped_and_reported(a, b, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_bytes(b"secret")
+    add_source(a, IMPORT, {})
+    (a.sources / IMPORT / "link.txt").symlink_to(outside)
+    s = run(a, b, NOW).summary()
+    assert s["sources"]["conflicts"] == [f"{IMPORT}/link.txt"]
+    assert not os.path.lexists(b.sources / IMPORT / "link.txt")
+    assert set(sources_of(b)) == {f"{IMPORT}/manifest.json", f"{IMPORT}/exif.json"}
+
+
+def test_symlink_against_a_real_file_is_not_overwritten(a, b, tmp_path):
+    put(a, f"sources/{IMPORT}/x.txt", b"real")
+    (b.sources / IMPORT).mkdir()
+    (b.sources / IMPORT / "x.txt").symlink_to(tmp_path / "elsewhere")
+    s = run(a, b, NOW).summary()
+    assert s["sources"] == {"a_to_b": 0, "b_to_a": 0, "conflicts": [f"{IMPORT}/x.txt"]}
+    assert (b.sources / IMPORT / "x.txt").is_symlink()
+
+
+def test_foreign_names_and_part_files_in_sources_are_not_copied(a, b):
+    put(a, "sources/notes/readme.txt", b"mine")
+    put(a, f"sources/{IMPORT}/exif.json.photokeep-part", b"half")
+    put(a, f"sources/{IMPORT}/exif.json", b"[]")
+    s = run(a, b, NOW).summary()
+    assert s["sources"] == {"a_to_b": 1, "b_to_a": 0, "conflicts": ["notes"]}
+    assert sources_of(b) == {f"{IMPORT}/exif.json": b"[]"}
+
+
+def test_interrupted_sources_copy_resumes(a, b, monkeypatch):
+    add_source(a, IMPORT, {"part1/Photos/IMG_1.JPG": b"x"})
+    monkeypatch.setattr(fsops, "copy_verified", fail_after(1))
+    with pytest.raises(CopyError):
+        run(a, b, NOW)
+    monkeypatch.undo()
+    run(a, b, NOW)
+    assert sources_of(b) == sources_of(a) and no_part_files(a, b)
+
+
+def test_sources_conflict_prints_and_exits_2(a, b, capsys):
+    put(a, f"sources/{IMPORT}/exif.json", b"[1]")
+    put(b, f"sources/{IMPORT}/exif.json", b"[2]")
+    assert main(["sync", str(a.root), str(b.root), "--json"]) == 2
+    assert json.loads(capsys.readouterr().out)["sources"]["conflicts"] == [f"{IMPORT}/exif.json"]
+    assert main(["sync", str(a.root), str(b.root)]) == 2
+    assert f"sources: 0 a->b, 0 b->a, conflicts: 1 ({IMPORT}/exif.json)" in capsys.readouterr().out
