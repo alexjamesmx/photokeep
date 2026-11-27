@@ -7,7 +7,7 @@ import json
 import math
 import re
 from collections import defaultdict
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Collection, Container, Iterable, Iterator
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -16,45 +16,57 @@ from photokeep.metadata import provider_record
 GOOGLE_PHOTOS = "Google Photos"
 ALBUM_METADATA = "metadata.json"  # an album folder's title; never a sidecar
 _SUFFIX = ".supplemental-metadata"
-_CUT = 51  # Google cuts a sidecar's whole file name to this many characters
+# A cut sidecar name keeps at least this much of <name>.supplemental-metadata, so that a short older one such as
+# IMG_1.json is never taken for IMG_12.jpg's.
+_SHORTEST_CUT = 30
 _NUMBERED = re.compile(r"(.*)\((\d+)\)")
-_EDITED = "-edited"
+_EDITED = re.compile(r"(.+)-edited(\(\d+\))?", re.IGNORECASE)
 
 
-def original(name: str) -> str | None:
-    """The name of the file an `-edited` copy (in any case) was made from."""
+def original(path: str, media: Container[str]) -> str | None:
+    """The path of the file an `-edited` copy (in any case) was made from, whether media lists it or not:
+    IMG-edited.jpg is IMG.jpg's, and IMG-edited(1).jpg is IMG(1).jpg's when media lists that, else IMG.jpg's."""
+    folder, _, name = path.rpartition("/")
     p = PurePosixPath(name)
-    if len(p.stem) > len(_EDITED) and p.stem.lower().endswith(_EDITED):
-        return p.stem[:-len(_EDITED)] + p.suffix
-    return None
+    m = _EDITED.fullmatch(p.stem)
+    if not m:
+        return None
+    if m[2] and (numbered := f"{folder}/{m[1]}{m[2]}{p.suffix}") in media:
+        return numbered
+    return f"{folder}/{m[1]}{p.suffix}"
 
 
-def _exact(name: str) -> str | None:
-    return f"{name}{_SUFFIX}.json"
+def _exact(name: str) -> Iterator[str]:
+    yield f"{name}{_SUFFIX}.json"
 
 
-def _numbered(name: str) -> str | None:
+def _numbered(name: str) -> Iterator[str]:
     """IMG(1).jpg's sidecar is IMG.jpg.supplemental-metadata(1).json."""
     p = PurePosixPath(name)
-    m = _NUMBERED.fullmatch(p.stem)
-    return f"{m[1]}{p.suffix}{_SUFFIX}({m[2]}).json" if m else None
+    if m := _NUMBERED.fullmatch(p.stem):
+        yield f"{m[1]}{p.suffix}{_SUFFIX}({m[2]}).json"
 
 
-def _cut(name: str) -> str | None:
-    whole = f"{name}{_SUFFIX}.json"
-    return whole[:_CUT - len(".json")] + ".json" if len(whole) > _CUT else None
+def _cut(name: str) -> Iterator[str]:
+    """Google cuts a long sidecar name (to 51 characters, by most reports): any shorter start of
+    <name>.supplemental-metadata, the longest first."""
+    whole = f"{name}{_SUFFIX}"
+    for end in range(len(whole) - 1, _SHORTEST_CUT - 1, -1):
+        yield f"{whole[:end]}.json"
 
 
-def _older(name: str) -> str | None:
-    return f"{name}.json"
+def _older(name: str) -> Iterator[str]:
+    yield f"{name}.json"
 
 
-def _older_stem(name: str) -> str | None:
+def _older_stem(name: str) -> Iterator[str]:
     stem = PurePosixPath(name).stem
-    return f"{stem}.json" if stem != name else None
+    if stem != name:
+        yield f"{stem}.json"
 
 
-_RULES: tuple[Callable[[str], str | None], ...] = (_exact, _numbered, _cut, _older, _older_stem)  # surest first
+# Surest first; each gives a file's possible sidecar names, the likeliest first.
+_RULES: tuple[Callable[[str], Iterator[str]], ...] = (_exact, _numbered, _cut, _older, _older_stem)
 
 
 def _claim(names: Collection[str], free: set[str]) -> dict[str, str]:
@@ -64,7 +76,7 @@ def _claim(names: Collection[str], free: set[str]) -> dict[str, str]:
     for rule in _RULES:
         wanted: dict[str, list[str]] = defaultdict(list)
         for name in names:
-            if name not in found and (target := rule(name)) in free:
+            if name not in found and (target := next((t for t in rule(name) if t in free), None)):
                 wanted[target].append(name)
         for target, by in wanted.items():
             free.discard(target)
@@ -73,17 +85,17 @@ def _claim(names: Collection[str], free: set[str]) -> dict[str, str]:
     return found
 
 
-def _in_folder(names: list[str], sidecars: set[str]) -> dict[str, str]:
+def _in_folder(folder: str, names: list[str], sidecars: set[str]) -> dict[str, str]:
     """An `-edited` copy is paired after every other file, so it never takes or blocks its original's sidecar, and
     shares that one when it has none of its own."""
-    edits = {n: o for n in names if (o := original(n))}
+    listed = {f"{folder}/{n}" for n in names}
+    edits = {n: o.rpartition("/")[2] for n in names if (o := original(f"{folder}/{n}", listed))}
     free = sidecars - {ALBUM_METADATA}
     # An original counts even when not listed: a reader of one import folder sees only the files it recorded.
     found = _claim({n for n in names if n not in edits} | set(edits.values()), free)
     found |= _claim([n for n in edits if n not in found], free)
     found |= {n: found[o] for n, o in edits.items() if n not in found and o in found}
-    listed = set(names)
-    return {n: s for n, s in found.items() if n in listed}
+    return {n: s for n, s in found.items() if f"{folder}/{n}" in listed}
 
 
 def pair(media: Iterable[str], sidecars: Iterable[str]) -> dict[str, str]:
@@ -98,7 +110,7 @@ def pair(media: Iterable[str], sidecars: Iterable[str]) -> dict[str, str]:
         folder, _, name = path.rpartition("/")
         jsons[folder].add(name)
     return {f"{folder}/{n}": f"{folder}/{s}" for folder, ns in names.items()
-            for n, s in _in_folder(ns, jsons.get(folder, set())).items()}
+            for n, s in _in_folder(folder, ns, jsons.get(folder, set())).items()}
 
 
 def _utc(value: object) -> str | None:

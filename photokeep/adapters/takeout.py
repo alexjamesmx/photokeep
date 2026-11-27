@@ -17,6 +17,7 @@ from photokeep.providers.takeout import ALBUM_METADATA, GOOGLE_PHOTOS, original,
 _TOP = "Takeout"
 _YEAR = re.compile(r"Photos from \d{4}")  # Google's folder for a year; every other folder is an album
 _UNREADABLE = (OSError, EOFError, zipfile.BadZipFile, zlib.error)
+_CHUNK = 1 << 20
 
 
 @dataclass(frozen=True)
@@ -50,18 +51,38 @@ def _folder(path: Path) -> Iterator[tuple[str, _File]]:
             yield f.relative_to(top).as_posix(), _File(path, st.st_size, opener(f))
 
 
+def _same(path: str, a: _File, b: _File) -> bool:
+    """Whether two parts hold the same bytes at path, compared as they are read."""
+    if a.size != b.size:
+        return False
+    try:
+        with a.read() as fa, b.read() as fb:
+            while chunk := fa.read(_CHUNK):
+                if fb.read(len(chunk)) != chunk:
+                    return False
+            return not fb.read(1)
+    except _UNREADABLE as e:
+        raise ImportFailed(f"{path} could not be read: {e}") from None
+
+
 def _files(sources: Sequence[Path]) -> dict[str, _File]:
-    """Every file in a folder of Google Photos/, by its path from Google Photos/ on."""
+    """Every file under Google Photos/, by its path from Google Photos/ on. One that several parts hold with the
+    same bytes is listed once."""
     files: dict[str, _File] = {}
     for src in sources:
-        found = [(p, f) for p, f in (_folder(src) if src.is_dir() else _zip(src))
-                 if p.startswith(f"{GOOGLE_PHOTOS}/") and p.count("/") >= 2 and not os_junk(PurePosixPath(p).name)]
-        if not found:
+        seen: set[str] = set()
+        for p, f in _folder(src) if src.is_dir() else _zip(src):
+            if not p.startswith(f"{GOOGLE_PHOTOS}/") or os_junk(PurePosixPath(p).name):
+                continue
+            if p in seen:
+                raise ImportFailed(f"{src} holds {p} twice")
+            seen.add(p)
+            if p not in files:
+                files[p] = f
+            elif not _same(p, files[p], f):
+                raise ImportFailed(f"{p} differs between {files[p].origin} and {src}")
+        if not seen:
             raise ImportFailed(f"{src} holds no {_TOP}/{GOOGLE_PHOTOS}/ files")
-        for p, f in found:
-            if p in files:
-                raise ImportFailed(f"{p} is in both {files[p].origin} and {src}")
-            files[p] = f
     return files
 
 
@@ -78,9 +99,9 @@ def _held(data: bytes) -> Callable[[], bytes]:
     return lambda: data
 
 
-def _album(folder: str, kept: dict[str, bytes]) -> str | None:
+def _album(folder: str | None, kept: dict[str, bytes]) -> str | None:
     """The album a folder is (None for a year's): its metadata.json's title, else the folder's name."""
-    if _YEAR.fullmatch(folder):
+    if folder is None or _YEAR.fullmatch(folder):
         return None
     meta = kept.get(f"{GOOGLE_PHOTOS}/{folder}/{ALBUM_METADATA}")
     return (record(meta).get("title") if meta else None) or folder
@@ -94,8 +115,10 @@ def _name(name: str, title: str | None) -> str:
     return name
 
 
-def _top(path: str) -> str:
-    return path.split("/")[1]  # Google Photos/<folder>/...
+def _subfolder(path: str) -> str | None:
+    """The folder of Google Photos/ a file is in; None for one directly in Google Photos/."""
+    parts = path.split("/")
+    return parts[1] if len(parts) > 2 else None
 
 
 def list(sources: Sequence[Path]) -> Listing:
@@ -105,21 +128,20 @@ def list(sources: Sequence[Path]) -> Listing:
     kept = {p: _bytes(p, f) for p, f in files.items() if p.lower().endswith(".json")}
     media = {p: f for p, f in files.items() if p not in kept}
     sidecar_of, clips = pair(media, kept), live_pairs(media)
-    albums = {folder: _album(folder, kept) for folder in {_top(p) for p in media}}
+    albums = {folder: _album(folder, kept) for folder in {_subfolder(p) for p in media}}
 
     def candidate(path: str) -> Candidate:
-        parent, _, name = path.rpartition("/")
+        name = PurePosixPath(path).name
         side = sidecar_of.get(path)
         rec = record(kept[side]) if side else {}
-        made_from = original(name)  # an edited copy keeps its own name: the sidecar it shares names the original
-        edit_of = f"{parent}/{made_from}" if made_from else None
-        album = albums[_top(path)]
+        made_from = original(path, media)  # an edited copy keeps its own name: its sidecar names the original
+        album = albums[_subfolder(path)]
         return Candidate(path, media[path].read, media[path].size, None,
                          name if made_from else _name(name, rec.get("title")), rec,
                          albums=(album,) if album else (), trashed=(rec.get("raw") or {}).get("trashed") is True,
                          favorite=bool(rec.get("favorite")), live_of=clips.get(path),
-                         edit_of=edit_of if edit_of in media else None,
+                         edit_of=made_from if made_from in media else None,
                          note=None if rec or made_from else ("sidecar is not a JSON object" if side else "no sidecar"))
 
-    order = sorted(media, key=lambda p: (albums[_top(p)] is not None, p))
+    order = sorted(media, key=lambda p: (albums[_subfolder(p)] is not None, p))
     return [candidate(p) for p in order], [SourceFile(p, _held(d)) for p, d in sorted(kept.items())]

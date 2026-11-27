@@ -3,7 +3,7 @@ SHA-256 and EXIF, the items it adds, the live ones it records another source of,
 that say so.
 """
 from collections import Counter
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import BinaryIO
@@ -141,7 +141,6 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
     shas, exif and import_of (the import id that records it) are by source path, for every candidate read;
     unread holds why each of the others could not be.
     """
-    problems += [problem(c, c.note) for c in candidates if c.note]
     problems += _unread(candidates, unread, shas, clips)
     attached = {c.source_path for c in clips.values()}
     meta = {c.source_path: derive(exif.get(c.source_path, {}), c.provider, c.name, c.mtime)
@@ -228,7 +227,22 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
     for clip in alone:
         take(clip, None, own_clip=True)
     _link_edits(state, items, shas, unread, problems)
+    _notes(items.values(), candidates, problems)
     return list(items.values()), outcome
+
+
+def _notes(items: Collection[Planned], candidates: list[Candidate], problems: list[dict]) -> None:
+    """The adapter's note on each file this import writes an event for, on that file's one problem row: a file
+    settled by an earlier run, skipped or unread gets none, so running an import again repeats no note."""
+    written = {s.copy.source_path for it in items for s in it.sources} | {
+        it.clip[0].source_path for it in items if it.clip}
+    rows = {row["source_path"]: row for row in problems}
+    for c in candidates:
+        if c.note and c.source_path in written:
+            if c.source_path in rows:
+                rows[c.source_path]["reason"] += f"; {c.note}"
+            else:
+                problems.append(problem(c, c.note))
 
 
 def _link_edits(state: State, items: dict[str, Planned], shas: dict[str, str], unread: dict[str, str],

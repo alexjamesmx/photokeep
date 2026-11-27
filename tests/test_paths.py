@@ -1,6 +1,7 @@
 import unicodedata
+from pathlib import PurePosixPath
 
-from photokeep.paths import assign, safe_name, valid_folder, valid_id
+from photokeep.paths import PART, assign, safe_name, valid_folder, valid_id
 from photokeep.state import fold
 from tests.helpers import T1, T2, T3, ev, imp
 
@@ -92,3 +93,20 @@ def test_assign_skips_items_with_unsafe_folder_or_id():
 def test_names_like_os_junk_are_escaped_so_scan_never_skips_an_original():
     assert [safe_name(n) for n in (".DS_Store", "._IMG_1.JPG", "THUMBS.DB", "Desktop.ini", "IMG_1.JPG")] == [
         "_.DS_Store", "_._IMG_1.JPG", "_THUMBS.DB", "_Desktop.ini", "IMG_1.JPG"]
+
+
+def test_long_name_is_cut_between_characters_keeping_its_extension():
+    name = "é" * 150 + ".jpeg"  # 305 bytes
+    cut = safe_name(name)
+    assert cut == "é" * 84 + ".jpeg" and len(cut.encode()) == 173
+    assert safe_name("a" * 300) == "a" * 173
+    assert safe_name("x" * 200 + "." + "y" * 200) == ("x" * 200 + "." + "y" * 200)[:173]  # no room for that extension
+    paths = assign(fold([imp(A, name=name, ts=T1), imp(B, name=name, ts=T2)]))
+    names = [PurePosixPath(paths[i]["main"]).name for i in (A, B)]
+    assert names == [cut, f"{'é' * 84}~{'b' * 8}.jpeg"]
+    assert all(len((n + PART).encode()) <= 255 for n in names)
+
+
+def test_names_that_fit_are_not_cut():
+    name = "é" * 84 + ".jpeg"
+    assert safe_name(name) == name and safe_name("a" * 173) == "a" * 173

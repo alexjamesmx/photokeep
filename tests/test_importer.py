@@ -10,7 +10,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from photokeep import events, fsops, importer, staging, sync
+from photokeep import events, fsops, importer, importplan, staging, sync
 from photokeep.cache import Cache
 from photokeep.events import read_all
 from photokeep.importer import Candidate, ImportFailed, SourceFile
@@ -643,3 +643,24 @@ def test_refuses_a_source_overlapping_the_copy(tmp_path, where):
     with pytest.raises(ImportFailed, match="overlap"):
         run(lib, cand("a/x.jpg", b"x"), roots=(tmp_path / "elsewhere", source))
     assert snapshot(lib) == before
+
+
+def test_adapter_notes_are_listed_once_for_files_this_import_records():
+    """A note reaches problems only for a file this import writes an event for, on that file's one row: not for one
+    an earlier run recorded, a duplicate, a deleted photo's copy or a file that could not be read."""
+    this = "2026-11-27-test-bbbbbb"
+    state = fold([imp(sha(b"held")), imp(sha(b"settled"), import_id=this), imp(sha(b"deleted")),
+                  ev("trash", sha(b"deleted"))])
+    cands = [cand(path, data, note="no sidecar", **marks) for path, data, marks in (
+        ("a/new.jpg", b"new", {}), ("a/new.MOV", b"clip", {"live_of": "a/new.jpg"}), ("a/copy.jpg", b"new", {}),
+        ("a/held.jpg", b"held", {}), ("a/settled.jpg", b"settled", {}), ("a/deleted.jpg", b"deleted", {}),
+        ("a/gone.jpg", b"gone", {}), ("a/IMG_9.JPG", b"photo", {}),
+        ("a/IMG_9.MOV", b"clip 9", {"live_of": "a/IMG_9.JPG"}))]
+    unread = dict.fromkeys(("a/gone.jpg", "a/IMG_9.JPG"), "could not be read: gone")
+    shas = {c.source_path: sha(c.read().read()) for c in cands if c.source_path not in unread}
+    problems: list[dict] = []
+    importplan.plan(state, cands, shas, {}, dict.fromkeys(shas, this), importplan.clips_of(cands), unread, problems)
+    assert sorted((r["source_path"], r["reason"]) for r in problems) == [
+        ("a/IMG_9.JPG", "could not be read: gone"), ("a/IMG_9.MOV", "clip kept as its own item; no sidecar"),
+        ("a/gone.jpg", "could not be read: gone"), ("a/held.jpg", "no sidecar"), ("a/new.MOV", "no sidecar"),
+        ("a/new.jpg", "no sidecar")]

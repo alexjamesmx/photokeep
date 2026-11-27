@@ -1,6 +1,7 @@
 """Google Takeout: sidecar pairing, the listing of zips and extracted folders, provider records, and an import."""
 import dataclasses
 import json
+import re
 import shutil
 import zipfile
 from dataclasses import dataclass
@@ -27,9 +28,9 @@ LONG = "PXL_20230806_181530412.PORTRAIT.jpg"  # its whole sidecar name would pas
 WIDE = "Screenshot_20230815-142536_com.android.chrome_"  # 46 characters: names after it share one cut sidecar
 
 
-def cut(name: str) -> str:
-    """The sidecar name Google writes for a file whose whole sidecar name passes 51 characters."""
-    return f"{name}.supplemental-metadata"[:46] + ".json"
+def cut(name: str, length: int = 51) -> str:
+    """The sidecar name Google writes for a file whose whole sidecar name passes `length` characters."""
+    return f"{name}.supplemental-metadata"[:length - len(".json")] + ".json"
 
 
 def sidecar(title: str, taken: int = 1709632800, geo: tuple = (0.0, 0.0), geo_exif: tuple | None = None,
@@ -63,12 +64,14 @@ def zip_part(path: Path, files: dict[str, bytes]) -> Path:
 
 def export(tmp_path: Path) -> Export:
     """A Takeout in two parts. Part 2 holds one year-folder sidecar and the album's metadata.json; the album Trip
-    holds a copy of a year-folder photo. Sidecars come in every name Google has used."""
+    holds a copy of a year-folder photo; one photo sits in Google Photos/ itself. Sidecars come in every name Google
+    has used."""
     first = exif_jpeg((10, 20, 30))
     names = ["IMG_0002.jpg", "IMG_0002(1).jpg", LONG, "OLD_1.jpg", "OLD_2.jpg", "IMG_0003.jpg",
              "IMG_0003-edited.jpg", "IMG_0004.jpg", "IMG_0005.jpg", "IMG_0006.jpg", "LONE.jpg"]
     media = {f"{Y}/IMG_0001.jpg": first, **{f"{Y}/{n}": jpeg_bytes((20 * k + 20, 0, 0)) for k, n in enumerate(names)},
-             f"{Y}/IMG_0004.MP4": b"live clip", f"{TRIP}/IMG_0001.jpg": first}
+             f"{Y}/IMG_0004.MP4": b"live clip", f"{TRIP}/IMG_0001.jpg": first,
+             f"{GP}/IMG_0007.jpg": jpeg_bytes((7, 7, 7))}
     plain = f"{Y}/IMG_0001.jpg.supplemental-metadata.json"
     sidecars = {
         f"{Y}/IMG_0002.jpg.supplemental-metadata.json": sidecar("IMG_0002.jpg", taken=1700000000),
@@ -83,6 +86,7 @@ def export(tmp_path: Path) -> Export:
         f"{Y}/IMG_0006.jpg.supplemental-metadata.json": sidecar("IMG_0006.jpg", geo_exif=(19.43, -99.13),
                                                                 favorited=True),
         f"{TRIP}/IMG_0001.jpg.supplemental-metadata.json": sidecar("IMG_0001.jpg"),
+        f"{GP}/IMG_0007.jpg.supplemental-metadata.json": sidecar("IMG_0007.jpg"),
     }
     later = {plain: sidecar("IMG_0001.jpg"), f"{TRIP}/metadata.json": json.dumps({"title": "Summer trip"}).encode()}
     pairs = {f"{Y}/IMG_0001.jpg": plain, f"{Y}/IMG_0002.jpg": f"{Y}/IMG_0002.jpg.supplemental-metadata.json",
@@ -92,7 +96,8 @@ def export(tmp_path: Path) -> Export:
              **{f"{Y}/{n}": f"{Y}/{n}.supplemental-metadata.json"
                 for n in ("IMG_0003.jpg", "IMG_0004.jpg", "IMG_0004.MP4", "IMG_0005.jpg", "IMG_0006.jpg")},
              f"{Y}/IMG_0003-edited.jpg": f"{Y}/IMG_0003.jpg.supplemental-metadata.json",
-             f"{TRIP}/IMG_0001.jpg": f"{TRIP}/IMG_0001.jpg.supplemental-metadata.json"}
+             f"{TRIP}/IMG_0001.jpg": f"{TRIP}/IMG_0001.jpg.supplemental-metadata.json",
+             f"{GP}/IMG_0007.jpg": f"{GP}/IMG_0007.jpg.supplemental-metadata.json"}
     parts = [zip_part(tmp_path / "takeout-001.zip", media | sidecars), zip_part(tmp_path / "takeout-002.zip", later)]
     return Export(parts, media, sidecars | later, pairs)
 
@@ -114,10 +119,22 @@ def test_numbered_copy_takes_the_numbered_sidecar():
         "IMG_1.jpg": "IMG_1.jpg.supplemental-metadata.json", "IMG_1(1).jpg": numbered}
 
 
+@pytest.mark.parametrize("length", [51, 47])
 @pytest.mark.parametrize("name", [LONG, WIDE + "1.jpg"])  # cut inside the suffix, or inside the name
-def test_sidecar_name_cut_at_51_characters(name):
-    assert len(cut(name)) == 51
-    assert pairs([name], [cut(name)]) == {name: cut(name)}
+def test_cut_sidecar_name(name, length):
+    assert len(cut(name, length)) == length
+    assert pairs([name], [cut(name, length)]) == {name: cut(name, length)}
+
+
+def test_longest_cut_sidecar_wins():
+    assert pairs([LONG], [cut(LONG, 47), cut(LONG, 51)]) == {LONG: cut(LONG, 51)}
+
+
+def test_too_short_a_start_is_no_cut_sidecar():
+    assert pairs(["IMG_12.jpg"], ["IMG_1.json"]) == {}
+    start = f"{LONG}.supplemental-metadata"
+    assert pairs([LONG], [f"{start[:29]}.json"]) == {}
+    assert pairs([LONG], [f"{start[:30]}.json"]) == {LONG: f"{start[:30]}.json"}
 
 
 @pytest.mark.parametrize("name", ["IMG_1.jpg.json", "IMG_1.json"])
@@ -137,8 +154,9 @@ def test_each_sidecar_name_comes_before_the_next():
 def test_a_sidecar_two_files_could_take_goes_to_neither():
     assert pairs(["IMG_1.jpg", "IMG_1.mp4"], ["IMG_1.json"]) == {}
     a, b = WIDE + "1.jpg", WIDE + "2.jpg"
-    assert cut(a) == cut(b)
-    assert pairs([a, b], [cut(a)]) == {}
+    for length in (51, 47):
+        assert cut(a, length) == cut(b, length)
+        assert pairs([a, b], [cut(a, length)]) == {}
 
 
 def test_edited_copy_shares_its_originals_sidecar():
@@ -153,6 +171,20 @@ def test_edited_copy_never_takes_or_blocks_its_originals_cut_sidecar():
     original, edited = WIDE + ".jpg", WIDE + "-edited.jpg"
     assert cut(original) == cut(edited)
     assert pairs([original, edited], [cut(original)]) == {original: cut(original), edited: cut(original)}
+
+
+def test_original_of_an_edited_copy():
+    assert provider.original(f"{Y}/IMG-edited(1).jpg", {f"{Y}/IMG(1).jpg"}) == f"{Y}/IMG(1).jpg"
+    assert provider.original(f"{Y}/IMG-edited(1).jpg", set()) == f"{Y}/IMG.jpg"
+    assert provider.original(f"{Y}/IMG-EDITED.jpg", set()) == f"{Y}/IMG.jpg"
+    assert provider.original(f"{Y}/IMG(1).jpg", set()) is provider.original(f"{Y}/-edited.jpg", set()) is None
+
+
+def test_numbered_edited_copy_shares_its_numbered_originals_sidecar():
+    plain, numbered = "IMG.jpg.supplemental-metadata.json", "IMG.jpg.supplemental-metadata(1).json"
+    assert pairs(["IMG.jpg", "IMG(1).jpg", "IMG-edited(1).jpg"], [plain, numbered]) == {
+        "IMG.jpg": plain, "IMG(1).jpg": numbered, "IMG-edited(1).jpg": numbered}
+    assert pairs(["IMG.jpg", "IMG-edited(1).jpg"], [plain, numbered]) == {"IMG.jpg": plain, "IMG-edited(1).jpg": plain}
 
 
 def test_edited_copy_keeps_a_sidecar_of_its_own():
@@ -201,7 +233,8 @@ def test_sidecar_that_is_not_a_json_object_gives_no_record(data):
 def test_listing_pairs_every_file_across_parts(tmp_path):
     e = export(tmp_path)
     cands, sources = takeout.list(e.parts)
-    assert [c.source_path for c in cands] == sorted(p for p in e.media if p.startswith(Y)) + [f"{TRIP}/IMG_0001.jpg"]
+    assert [c.source_path for c in cands] == sorted(p for p in e.media if p != f"{TRIP}/IMG_0001.jpg") + [
+        f"{TRIP}/IMG_0001.jpg"]  # an album's copies after the rest
     by = {c.source_path: c for c in cands}
     assert {p: c.provider for p, c in by.items() if c.provider} == {
         m: provider.record(e.sidecars[s]) for m, s in e.pairs.items()}
@@ -227,6 +260,21 @@ def test_records_read_the_sidecar(tmp_path):
     assert (by[f"{Y}/IMG_0001.jpg"]["lat"], by[f"{Y}/IMG_0001.jpg"]["lon"]) == (None, None)
     assert by[f"{Y}/IMG_0003.jpg"]["description"] == "Birthday"
     assert by[f"{Y}/IMG_0003-edited.jpg"] == by[f"{Y}/IMG_0003.jpg"]
+
+
+def test_sidecar_that_is_not_json_is_noted_and_kept(tmp_path):
+    part = zip_part(tmp_path / "t.zip", {f"{Y}/IMG_1.jpg": b"x", f"{Y}/IMG_1.jpg.supplemental-metadata.json": b"{oops"})
+    (c,), kept = takeout.list([part])
+    assert (c.provider, c.note, [s.read() for s in kept]) == ({}, "sidecar is not a JSON object", [b"{oops"])
+
+
+def test_numbered_edited_copy_is_an_edit_of_the_numbered_original(tmp_path):
+    part = zip_part(tmp_path / "t.zip", {f"{Y}/IMG.jpg": b"a", f"{Y}/IMG(1).jpg": b"b", f"{Y}/IMG-edited(1).jpg": b"c",
+                                         f"{Y}/IMG.jpg.supplemental-metadata(1).json": sidecar("IMG.jpg")})
+    by = {c.source_path: c for c in takeout.list([part])[0]}
+    edit = by[f"{Y}/IMG-edited(1).jpg"]
+    assert (edit.edit_of, edit.provider, edit.name, edit.note) == (f"{Y}/IMG(1).jpg", by[f"{Y}/IMG(1).jpg"].provider,
+                                                                   "IMG-edited(1).jpg", None)
 
 
 def test_album_without_metadata_is_named_by_its_folder(tmp_path):
@@ -266,10 +314,33 @@ def test_refuses_what_is_no_takeout(tmp_path):
         takeout.list([tmp_path / "empty"])
 
 
-def test_refuses_a_file_in_two_sources(tmp_path):
-    part = export(tmp_path).parts[0]
-    with pytest.raises(ImportFailed, match="is in both"):
-        takeout.list([part, part])
+def test_parts_that_hold_the_same_file_list_it_once(tmp_path):
+    e = export(tmp_path)
+    again = zip_part(tmp_path / "takeout-003.zip", {f"{Y}/IMG_0002.jpg": e.media[f"{Y}/IMG_0002.jpg"],
+                                                    f"{TRIP}/metadata.json": e.sidecars[f"{TRIP}/metadata.json"]})
+
+    def listing(sources: list[Path]) -> tuple[list, list]:
+        cands, kept = takeout.list(sources)
+        return [dataclasses.replace(c, read=None) for c in cands], [(s.path, s.read()) for s in kept]
+
+    assert listing([*e.parts, again]) == listing([*e.parts, *e.parts]) == listing(e.parts)
+
+
+@pytest.mark.parametrize("other", [b"y" * 8, b"x" * 9])  # same size and other bytes, or another size
+def test_refuses_a_path_whose_parts_differ(tmp_path, other):
+    a = zip_part(tmp_path / "a.zip", {f"{Y}/IMG_1.jpg": b"x" * 8, f"{Y}/IMG_2.jpg": b"two"})
+    b = zip_part(tmp_path / "b.zip", {f"{Y}/IMG_1.jpg": other})
+    with pytest.raises(ImportFailed, match=re.escape(f"{Y}/IMG_1.jpg differs between {a} and {b}")):
+        takeout.list([a, b])
+
+
+def test_refuses_a_zip_that_holds_a_path_twice(tmp_path):
+    path = tmp_path / "t.zip"
+    with zipfile.ZipFile(path, "w") as zf, pytest.warns(UserWarning, match="Duplicate name"):
+        zf.writestr(f"Takeout/{Y}/IMG_1.jpg", b"one")
+        zf.writestr(f"Takeout/{Y}/IMG_1.jpg", b"one")
+    with pytest.raises(ImportFailed, match=re.escape(f"{path} holds {Y}/IMG_1.jpg twice")):
+        takeout.list([path])
 
 
 def write_import_folder(folder: Path, e: Export, sources, paths: list[str]) -> None:
@@ -307,13 +378,13 @@ def test_takeout_import(lib, tmp_path, mexico):
     e = export(tmp_path)
     cands, sources = takeout.list(e.parts)
     got = importer.run(lib, "takeout", cands, sources, False, datetime.now(UTC), roots=e.parts)
-    assert got == {"imported": 12, "versions": 0, "edits": 1, "live_clips": 1, "already_in_library": 0,
+    assert got == {"imported": 13, "versions": 0, "edits": 1, "live_clips": 1, "already_in_library": 0,
                    "duplicates_in_source": 1, "skipped_deleted": 0, "trashed": 1, "album_links": 1, "favorites": 1,
-                   "bytes": sum(len(d) for p, d in e.media.items() if p.startswith(Y)),
+                   "bytes": sum(len(d) for p, d in e.media.items() if not p.startswith(TRIP)),
                    "problems": [{"source_path": f"{Y}/LONE.jpg", "reason": "no sidecar"}]}
     state = fold(read_all(lib))
     item = {p: state.items.get(sha(d)) for p, d in e.media.items()}
-    assert len(state.items) == 12
+    assert len(state.items) == 13
     assert item[f"{Y}/IMG_0001.jpg"].albums == {("album", "Summer trip")}
     assert item[f"{Y}/IMG_0003-edited.jpg"].edit_of == sha(e.media[f"{Y}/IMG_0003.jpg"])
     assert [f["sha256"] for f in item[f"{Y}/IMG_0004.jpg"].files if f["role"] == "live"] == [sha(b"live clip")]
@@ -329,3 +400,5 @@ def test_takeout_import(lib, tmp_path, mexico):
     assert sorted(where) == sorted(e.media)  # the album's copy too, at the one item's path
     assert where[f"{TRIP}/IMG_0001.jpg"] == where[f"{Y}/IMG_0001.jpg"] == "originals/2024/03/IMG_0001.jpg"
     assert provider.read(folder) == {c.source_path: c.provider for c in cands if c.provider}
+    again = importer.run(lib, "takeout", cands, sources, False, datetime.now(UTC), roots=e.parts)
+    assert (again["imported"], again["already_in_library"], again["problems"]) == (0, 13, [])  # no note again

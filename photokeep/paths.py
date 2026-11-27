@@ -11,6 +11,10 @@ _JUNK = frozenset({".ds_store", "thumbs.db", "desktop.ini"})
 _FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _FOLDER = re.compile(r"[0-9]{4}/[0-9]{2}")
 _ID = re.compile(r"[0-9a-f]{64}")
+# A file system takes names of 255 bytes (ext4, APFS) or 255 UTF-16 units (exFAT, NTFS), and UTF-8 never needs
+# fewer bytes than UTF-16 units. A safe name leaves room for the "_" safe_name may add at either end, the clash
+# suffix _unique may add (~ and at most a whole id) and PART.
+_MAX_NAME = 255 - 2 - len("~") - 64 - len(PART)
 
 
 def os_junk(name: str) -> bool:
@@ -18,8 +22,29 @@ def os_junk(name: str) -> bool:
     return name.casefold() in _JUNK or name.startswith("._")
 
 
+def _size(text: str) -> int:
+    return len(text.encode("utf-8", "surrogatepass"))
+
+
+def _fit(name: str) -> str:
+    """name cut to _MAX_NAME UTF-8 bytes between two characters, keeping its extension: a source can name a file
+    longer than a library's file system takes, with the suffixes a library adds."""
+    if _size(name) <= _MAX_NAME:
+        return name
+    stem, dot, ext = name.rpartition(".")
+    stem, ext = (stem, dot + ext) if stem and _size(dot + ext) < _MAX_NAME else (name, "")
+    room, kept = _MAX_NAME - _size(ext), []
+    for ch in stem:
+        room -= _size(ch)
+        if room < 0:
+            break
+        kept.append(ch)
+    cut = "".join(kept)
+    return cut + ext if ext else cut.rstrip(". ")
+
+
 def safe_name(name: str) -> str:
-    cleaned = _FORBIDDEN.sub("_", unicodedata.normalize("NFC", name)).rstrip(". ")
+    cleaned = _fit(_FORBIDDEN.sub("_", unicodedata.normalize("NFC", name)).rstrip(". "))
     if os_junk(cleaned):  # scan skips junk, so an original by that name would look missing for ever
         cleaned = "_" + cleaned
     # scan deletes *.photokeep-part files as leftovers, so no original may end that way. Compared
