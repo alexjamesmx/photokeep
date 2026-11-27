@@ -63,6 +63,7 @@ Module map (`photokeep/`):
 - `fsops.py`: scan, plan and apply layout, hash-verified copy.
 - `hashcache.py`: size+mtime hash cache in `cache/files.sqlite`.
 - `sync.py`: logs, purges, sources, files, optional app, index refresh.
+- `sync_sources.py`: the `sources/` part of sync: write-once import folders, files only added.
 - `verify.py`: `verify` and `repair`.
 - `status.py`: counts for `status`.
 - `cache.py`: viewer index `cache/index.sqlite` and thumbnails.

@@ -4,8 +4,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from photokeep import events, fsops, hashcache
-from photokeep import sync as sync_module
+from photokeep import events, fsops, hashcache, sync_sources
 from photokeep.cache import Cache
 from photokeep.cli import main
 from photokeep.events import LogCorrupt, append_lines, read_all, read_log, ts_str
@@ -490,14 +489,14 @@ def test_link_that_appears_after_planning_is_refused(a, b, tmp_path, monkeypatch
     outside.mkdir()
     put(a, f"sources/{IMPORT}/sub/file.txt", b"real")
     (b.sources / IMPORT).mkdir()
-    real = sync_module._compare_sources
+    real = sync_sources.compare
 
     def compare_then_link(x, y):
         found = real(x, y)
         (b.sources / IMPORT / "sub").symlink_to(outside)
         return found
 
-    monkeypatch.setattr(sync_module, "_compare_sources", compare_then_link)
+    monkeypatch.setattr(sync_sources, "compare", compare_then_link)
     assert run(a, b, NOW).summary()["sources"] == {"a_to_b": 0, "b_to_a": 0, "conflicts": [f"{IMPORT}/sub/file.txt"]}
     assert list(outside.iterdir()) == []
 
