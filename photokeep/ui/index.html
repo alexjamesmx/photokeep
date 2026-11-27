@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="token" content="__TOKEN__">
+<title>Photos</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='9' fill='%234285f4'/%3E%3Cpath d='M7 23l6-7 4 5 3-3 5 5z' fill='%23fff'/%3E%3Ccircle cx='21' cy='11' r='3' fill='%23fff'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/app.css">
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <div class="brand"><span class="logo" id="logo"></span><span>Photos</span></div>
+    <nav id="nav"></nav>
+    <div class="sidefoot" id="sidefoot"></div>
+  </aside>
+  <main id="main">
+    <header id="top">
+      <label class="search"><span id="searchicon"></span>
+        <input id="q" type="search" autocomplete="off" placeholder="Search by date (2023-08), name, album, memory or camera">
+      </label>
+      <div class="tools">
+        <div class="chips" id="types"></div>
+        <select id="year" aria-label="Year"></select>
+        <select id="sort" aria-label="Sort"></select>
+        <label class="zoom" title="Thumbnail size"><span id="zoomicon"></span><input id="zoom" type="range" min="0" max="4" step="1"></label>
+        <button class="iconbtn" id="theme" title="Light or dark theme" aria-label="Toggle theme"></button>
+      </div>
+    </header>
+    <div id="selbar" hidden></div>
+    <div id="viewhead"></div>
+    <div id="scrollwrap">
+      <div id="scroller"><div id="content"><div class="loading">Loading your library…</div></div></div>
+      <div id="rail" hidden aria-label="Timeline"></div>
+    </div>
+  </main>
+</div>
+<div id="viewer" hidden></div>
+<div id="dialog" hidden></div>
+<div id="toast" hidden></div>
+<script src="/timeline.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

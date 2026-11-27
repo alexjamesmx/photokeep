@@ -11,7 +11,7 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing, contextmanager
@@ -115,8 +115,10 @@ def _import_sources(folder: Path) -> tuple[dict[str, _Source], int]:
     return files, errors
 
 
-def _sources(lib: Library) -> tuple[_Sources, int]:
-    found = {d.name: _import_sources(d) for d in sorted(lib.sources.iterdir()) if d.is_dir() and not d.is_symlink()}
+def _sources(lib: Library, imports: set[str] | None = None) -> tuple[_Sources, int]:
+    """What sources/ says, about every import or only the named ones."""
+    found = {d.name: _import_sources(d) for d in sorted(lib.sources.iterdir())
+             if d.is_dir() and not d.is_symlink() and (imports is None or d.name in imports)}
     return {i: files for i, (files, _) in found.items()}, sum(errors for _, errors in found.values())
 
 
@@ -148,11 +150,16 @@ def _row(item: Item, main_path: str, sources: _Sources) -> dict:
     }
 
 
-def _rows(lib: Library, state: State) -> tuple[list[dict], int]:
-    """One row per item, and the number of source problems met (unreadable files, unusable metadata)."""
-    sources, errors = _sources(lib)
+def _rows(lib: Library, state: State, only: set[str] | None = None) -> tuple[list[dict], int]:
+    """One row per item (or per item in `only`), and the number of source problems met (unreadable
+    files, unusable metadata)."""
+    paths = assign(state)  # of every item: one item's path depends on the others' names
+    if only is not None:
+        paths = {i: roles for i, roles in paths.items() if i in only}
+    imports = None if only is None else {i for item_id in paths for i in state.items[item_id].imports}
+    sources, errors = _sources(lib, imports)
     rows = []
-    for item_id, roles in assign(state).items():
+    for item_id, roles in paths.items():
         if "main" not in roles:
             continue
         item = state.items[item_id]
@@ -322,9 +329,33 @@ class Cache:
         out["pv"] = int(bool(out["pv"]) and self.preview_path(out["id"]).exists())
         return out
 
-    def items_json(self) -> list[dict]:
+    def refresh_items(self, ids: Iterable[str]) -> None:
+        """Rebuild only these items' rows, keeping their similarity groups: after a viewer edit to a few
+        items, a full refresh would regroup the whole library."""
+        ids = set(ids)
+        state = fold(read_all(self.lib))
+        rows, _ = _rows(self.lib, state, ids)
         with self._db() as db:
-            return [self._item(r) for r in db.execute(f"{_SELECT} ORDER BY t DESC, i.id DESC")]
+            self._prune(db, state)
+            db.execute("BEGIN IMMEDIATE")
+            with db:
+                for r in rows:
+                    old = db.execute("SELECT g, b FROM items WHERE id = ?", (r["id"],)).fetchone()
+                    r["g"], r["b"] = (old["g"], old["b"]) if old else (None, 0)
+                db.executemany("DELETE FROM items WHERE id = ?", [(i,) for i in ids])
+                db.executemany(f"INSERT INTO items VALUES ({', '.join('?' * len(_COLUMNS))})",
+                               ([r[c] for c in _COLUMNS] for r in rows))
+
+    def items_json(self, ids: Iterable[str] | None = None) -> list[dict]:
+        """Every item's row, newest first; with ids, only those items' rows."""
+        with self._db() as db:
+            if ids is None:
+                return [self._item(r) for r in db.execute(f"{_SELECT} ORDER BY t DESC, i.id DESC")]
+            wanted = list(ids)
+            # in chunks: SQLite caps the number of parameters in one statement
+            chunks = (wanted[k:k + 500] for k in range(0, len(wanted), 500))
+            return [self._item(r) for chunk in chunks
+                    for r in db.execute(f"{_SELECT} WHERE i.id IN ({', '.join('?' * len(chunk))})", chunk)]
 
     def item_json(self, item_id: str) -> dict | None:
         with self._db() as db:

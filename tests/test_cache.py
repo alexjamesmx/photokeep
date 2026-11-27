@@ -204,6 +204,23 @@ def test_purged_item_leaves_the_index_with_its_thumbnails(lib):
         assert db.execute("SELECT count(*) FROM media").fetchone() == (0,)
 
 
+def test_refresh_items_rewrites_only_the_named_rows(lib):
+    a, b, c = (add_item(lib, data, name=name) for data, name in ((b"a", "A.JPG"), (b"b", "B.JPG"), (b"c", "C.JPG")))
+    cache = refreshed(lib)
+    with closing(sqlite3.connect(lib.cache / "index.sqlite")) as db, db:
+        db.execute("UPDATE items SET g = 'g1', b = 1 WHERE id = ?", (a,))
+    for item in (a, b):
+        mark(lib, "favorite", item)
+    mark(lib, "trash", c)
+    mark(lib, "purge", c, ts=T2)
+    cache.refresh_items([a, c])
+    x, y = cache.item_json(a), cache.item_json(b)
+    assert (x["f"], x["g"], x["b"]) == (1, "g1", 1)  # rewritten from the log, similarity group kept
+    assert y["f"] == 0  # not named: as the last refresh left it
+    assert cache.item_json(c) is None
+    assert [r["id"] for r in cache.items_json([b, "0" * 64])] == [b]
+
+
 def test_thumb_and_preview_paths(lib):
     cache, x = Cache(lib), "ab" + "0" * 62
     assert cache.thumb_path(x) == lib.cache / "thumbs" / "ab" / f"{x}.jpg"

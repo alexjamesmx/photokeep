@@ -2,13 +2,12 @@
 import os
 import re
 import shutil
-import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import NamedTuple
 
-from photokeep import events, fsops
+from photokeep import appcopy, events, fsops
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt, encode, new_event, ordered, parse_log, read_all, ts_str
 from photokeep.fsops import LayoutPlan, apply_layout, inside, plan_layout, scan
@@ -18,7 +17,6 @@ from photokeep.paths import PART
 from photokeep.state import State, fold
 
 _VERSION = re.compile(r"""^__version__\s*=\s*["']([0-9]+(?:\.[0-9]+)*)["']""", re.MULTILINE)
-_APP_WORK = "app-update-"  # prefix of the app update's work folders under cache/
 
 _IMPORT_ID = re.compile(r"^\d{4}-\d{2}-\d{2}-[a-z0-9]+-[0-9a-f]+$")
 
@@ -327,36 +325,8 @@ def _copy(src: Library, dst: Library, side: str, found: Found, todo: Files) -> l
     return bad
 
 
-def _refuse_links(top: Path) -> None:
-    """Raise unless top holds only plain folders and files: a symlink in an app could run code from anywhere."""
-    paths = [top] + [Path(folder) / name for folder, dirs, files in os.walk(top) for name in dirs + files]
-    for path in paths:
-        if path.is_symlink() or not (path.is_dir() or path.is_file()):
-            raise LibraryError(f"{path} is a symlink or a special file; the app is not copied")
-
-
 def _replace_app(src: Library, dst: Library) -> None:
-    work = Path(tempfile.mkdtemp(prefix=_APP_WORK, dir=dst.cache_dir()))
-    try:
-        shutil.copytree(src.app, work / "new", symlinks=True)
-        _refuse_links(work / "new")  # src may have changed since it was checked
-    except BaseException:
-        shutil.rmtree(work)
-        raise
-    os.replace(dst.app, work / "old")
-    os.replace(work / "new", dst.app)  # a crash between the two renames leaves old/ for _restore_app
-    shutil.rmtree(work)
-
-
-def _restore_app(lib: Library) -> None:
-    """Clear up after an app update that was cut off: put app/ back if it is gone, then drop the work folders."""
-    for work in sorted(lib.cache_dir().glob(_APP_WORK + "*")):
-        if work.is_symlink() or not work.is_dir():
-            continue
-        old = work / "old"
-        if not os.path.lexists(lib.app) and old.is_dir() and not old.is_symlink():
-            os.replace(old, lib.app)
-        shutil.rmtree(work)
+    appcopy.replace(dst, lambda new: shutil.copytree(src.app, new, symlinks=True))
 
 
 def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> SyncPlan:
@@ -368,12 +338,12 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
     with locked(a), locked(b):
         if update_app:
             for lib in (a, b):
-                _restore_app(lib)
+                appcopy.restore(lib)
         app = _app(a, b)
         ends = None
         if update_app and app.direction:
             ends = (a, b) if app.direction == "a->b" else (b, a)
-            _refuse_links(ends[0].app)  # refused before anything changes
+            appcopy.refuse_links(ends[0].app)  # refused before anything changes
         transfers = exchange_logs(a, b, dry_run=False)
         due = _due(fold(read_all(a)), now)
         events.append(a, _purge_events(a, due, now))

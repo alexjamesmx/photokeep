@@ -2,11 +2,12 @@ import argparse
 import json
 import sqlite3
 import sys
+import webbrowser
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photokeep import __version__, media, status, sync, verify
+from photokeep import __version__, appcopy, media, server, status, sync, verify
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
@@ -37,7 +38,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             lib = init_copy(args.path, args.name, of=open_library(args.copy_of))
         else:
             lib = init_library(args.path, args.name)
-    except LibraryError as e:
+        appcopy.install(lib)
+    except (LibraryError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
     if args.json:
@@ -211,10 +213,42 @@ def cmd_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def _serve_args(p: argparse.ArgumentParser) -> None:
+    _copy_arg(p)
+    p.add_argument("--port", type=int, default=8765, help=f"first port to try (default 8765; {server.PORTS} are tried)")
+    p.add_argument("--no-browser", action="store_true", help="only print the address; open no browser")
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Open the viewer for a copy (runs until Ctrl+C)."""
+    try:
+        # absolute: the launchers pass ".", and the page shows the root and hands paths to other apps
+        lib = open_library(args.copy.absolute())
+        srv = server.make_server(lib, args.port)
+    except (LibraryError, LogCorrupt, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        return _cache_db_error(e)
+    url = f"http://127.0.0.1:{srv.server_port}/"
+    text = f"Photos: {lib.root}\nOpen {url}  (Ctrl+C to stop)"
+    print(json.dumps({"root": str(lib.root), "url": url}) if args.json else text, flush=True)
+    if not args.no_browser:
+        webbrowser.open(url)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()
+    return 0
+
+
 COMMANDS["verify"], ARGUMENTS["verify"] = cmd_verify, _verify_args
 COMMANDS["repair"], ARGUMENTS["repair"] = cmd_repair, _repair_args
 COMMANDS["status"], ARGUMENTS["status"] = cmd_status, _copy_arg
 COMMANDS["cache"], ARGUMENTS["cache"] = cmd_cache, _cache_args
+COMMANDS["serve"], ARGUMENTS["serve"] = cmd_serve, _serve_args
 
 
 def build_parser() -> argparse.ArgumentParser:

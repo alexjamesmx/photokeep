@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from typing import TypeGuard
 
 from photokeep.state import State
 
@@ -22,7 +23,7 @@ def valid_folder(folder: object) -> bool:
     return folder == "undated" or (isinstance(folder, str) and _FOLDER.fullmatch(folder) is not None)
 
 
-def valid_id(item_id: object) -> bool:
+def valid_id(item_id: object) -> TypeGuard[str]:
     return isinstance(item_id, str) and _ID.fullmatch(item_id) is not None
 
 
