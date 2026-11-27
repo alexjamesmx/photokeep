@@ -87,3 +87,8 @@ def test_valid_folder_and_id():
 def test_assign_skips_items_with_unsafe_folder_or_id():
     s = fold([imp(A, folder="../../x", ts=T1), imp("../../etc/" + "a" * 54, ts=T2), imp(B, ts=T3)])
     assert list(assign(s)) == [B]
+
+
+def test_names_like_os_junk_are_escaped_so_scan_never_skips_an_original():
+    assert [safe_name(n) for n in (".DS_Store", "._IMG_1.JPG", "THUMBS.DB", "Desktop.ini", "IMG_1.JPG")] == [
+        "_.DS_Store", "_._IMG_1.JPG", "_THUMBS.DB", "_Desktop.ini", "IMG_1.JPG"]

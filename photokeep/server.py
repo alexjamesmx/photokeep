@@ -163,6 +163,11 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: object) -> None:
         pass  # a scrolling grid makes hundreds of requests a second
 
+    def end_headers(self) -> None:
+        # Every answer: a photo from another copy must never be run as a page or a script.
+        self.send_header("X-Content-Type-Options", "nosniff")
+        super().end_headers()
+
     def host_ok(self) -> bool:
         # Refuse requests addressed to other host names (DNS rebinding).
         port = self.server.server_port

@@ -64,7 +64,7 @@ def test_item_json_has_the_viewer_keys(lib):
     x = cache.item_json(a)
     assert set(x) == KEYS and x in cache.items_json() and len(cache.items_json()) == 2
     assert (x["id"], x["n"], x["dir"], x["k"], x["sc"], x["s"], x["lv"], x["th"], x["pv"]) == \
-        (a, "IMG_1.JPG", "originals/2024/01", "p", 0, 1, 0, 0, 0)
+        (a, "IMG_1.JPG", "originals/2024/01", "p", 0, len(b"photo a"), 0, 0, 0)
     assert (x["f"], x["hi"], x["al"], x["me"], x["tr"], x["ta"], x["r"], x["left"], x["g"], x["b"]) == \
         (0, 0, [], [], 0, None, None, None, None, 0)
     assert cache.item_json("0" * 64) is None

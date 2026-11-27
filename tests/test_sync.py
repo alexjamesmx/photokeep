@@ -600,3 +600,22 @@ def test_cli_sync_with_relative_paths(a, b, monkeypatch):
     monkeypatch.chdir(a.root.parent)
     assert main(["sync", "A", "B", "--yes"]) == 0
     assert files_of(b) == files_of(a) == {"originals/2024/01/A.JPG": b"photo"}
+
+
+def test_os_junk_is_not_copied_or_reported(a, b):
+    add_item(a, b"photo", name="A.JPG")
+    put(a, "originals/2024/01/.DS_Store", b"finder")
+    put(a, "originals/2024/01/._A.JPG", b"apple double")
+    s = run(a, b, NOW).summary()
+    assert s["pending"] == {"a": CLEAN, "b": CLEAN} and files_of(b) == {"originals/2024/01/A.JPG": b"photo"}
+    assert (a.root / "originals/2024/01/.DS_Store").read_bytes() == b"finder"
+
+
+def test_plan_counts_the_bytes_each_way(a, b, capsys):
+    add_item(a, b"from a", name="A.JPG")
+    add_item(a, b"also from a", name="C.JPG")
+    add_item(b, b"from b", name="B.JPG")
+    s = plan(a, b, NOW).summary()
+    assert (s["bytes_a_to_b"], s["bytes_b_to_a"]) == (len(b"from a") + len(b"also from a"), len(b"from b"))
+    assert main(["sync", str(a.root), str(b.root)]) == 0
+    assert "bytes: 17 a->b, 6 b->a" in capsys.readouterr().out

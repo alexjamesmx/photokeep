@@ -12,8 +12,8 @@ Use when the owner asks to sync, back up or bring two copies level. Both copies 
    ```
    photokeep sync <copy-a> <copy-b> --json
    ```
-   Read the fields:
-   - `copy_a_to_b`, `copy_b_to_a`: files that will be copied.
+   Exit 2 means the plan already shows a problem (see step 5 for the fields): stop and ask the owner. Otherwise read the fields:
+   - `copy_a_to_b`, `copy_b_to_a`: files that will be copied; `bytes_a_to_b`, `bytes_b_to_a`: the space they take.
    - `new_purges`: items whose 30 days in the trash are over; their files will be deleted.
    - `layout_a.deletes`, `layout_b.deletes`: files that will be deleted. `moves` are renames.
    - `app.direction`: not null when the two apps differ in version (see [update-app](update-app.md)).
@@ -22,7 +22,7 @@ Use when the owner asks to sync, back up or bring two copies level. Both copies 
    ```
    photokeep sync <copy-a> <copy-b> --yes --json
    ```
-   Success: exit 0, `missing_both` 0, `conflicts` 0, `bad_sources` empty, `sources.conflicts` empty, `failed` empty, and `pending` shows `moves`, `deletes`, `missing`, `untracked` and `conflicts` all 0 for both `a` and `b`. An interrupted sync is finished by running it again.
+   Success of this `--yes` run (a plan has `pending` null): exit 0, `missing_both` 0, `conflicts` 0, `bad_sources` empty, `sources.conflicts` empty, `failed` empty, and `pending` shows `moves`, `deletes`, `missing`, `untracked` and `conflicts` all 0 for both `a` and `b`. An interrupted sync is finished by running it again.
 5. If the exit code is 2, the copies could not be made whole. Stop and ask the owner. Do not retry or delete anything. Report which field is non-zero:
    - `missing_both`: files the log expects that neither copy holds. A third copy may have them.
    - `bad_sources`: files in `sources/` that failed their hash, skipped.

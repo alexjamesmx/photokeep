@@ -35,7 +35,7 @@ class State:
     def apply(self, e: dict) -> None:
         # Events arrive in (ts, copy, id) order; every fold rule lives in this method.
         op = e["op"]
-        item = self.items.get(e.get("item"))
+        item = self.items.get(e["item"]) if "item" in e else None
         match op:
             case "copy.name":
                 self.copies[e["copy"]] = e["name"]
@@ -92,11 +92,12 @@ class State:
     def is_blocked(self, sha: str, fingerprint: tuple | None = None) -> bool:
         if sha in self.tombstones or (sha in self.items and self.items[sha].blocked):
             return True
-        return any(self.items[i].blocked for i in self.fingerprints.get(fingerprint, ()))
+        return fingerprint is not None and any(self.items[i].blocked for i in self.fingerprints.get(fingerprint, ()))
 
     def due_purges(self, now: datetime, days: int = TRASH_DAYS) -> list[str]:
         cutoff = ts_str(now - timedelta(days=days))
-        return sorted(i.id for i in self.items.values() if i.status == "trashed" and i.trashed_at <= cutoff)
+        return sorted(i.id for i in self.items.values()
+                      if i.status == "trashed" and i.trashed_at is not None and i.trashed_at <= cutoff)
 
 
 def fold(events: Iterable[dict]) -> State:

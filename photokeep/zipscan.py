@@ -1,5 +1,6 @@
 """SHA-256 of the files inside zip archives, read in place: an export's zips are hashed, never extracted."""
 import hashlib
+import io
 import os
 import zipfile
 import zlib
@@ -8,6 +9,7 @@ from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from functools import cache
 from pathlib import Path, PurePosixPath
+from typing import cast
 
 
 class ZipScanError(Exception):
@@ -36,7 +38,8 @@ def _open(path: Path) -> zipfile.ZipFile:
 def _sha(path: Path, name: str) -> str | None:
     try:
         with _open(path).open(name) as f:
-            return hashlib.file_digest(f, "sha256").hexdigest()
+            # a ZipExtFile, which reads into buffers as file_digest wants; typeshed calls it IO[bytes]
+            return hashlib.file_digest(cast(io.BufferedIOBase, f), "sha256").hexdigest()
     except (OSError, EOFError, zipfile.BadZipFile, zlib.error):  # damaged data or a CRC that does not match
         return None
 

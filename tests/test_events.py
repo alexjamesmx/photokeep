@@ -92,7 +92,8 @@ def test_append_works_where_the_filesystem_has_no_locks(lib, monkeypatch, code):
 
 
 ITEM = "a" * 64
-FILE = {"role": "main", "name": "A.JPG", "sha256": ITEM}
+FILE = {"role": "main", "name": "A.JPG", "sha256": ITEM, "size": 5}
+CLIP = {"role": "live", "name": "A.MOV", "sha256": "b" * 64, "size": 3}
 IMPORT = {"op": "import", "item": ITEM, "folder": "2024/01", "import": "i", "files": [FILE], "fingerprint": None}
 
 
@@ -101,6 +102,7 @@ IMPORT = {"op": "import", "item": ITEM, "folder": "2024/01", "import": "i", "fil
     {"op": "copy.name", "name": "drive"},
     IMPORT,
     IMPORT | {"fingerprint": ["2024-01-01T00:00:00", "Camera", 8, 8]},
+    IMPORT | {"files": [CLIP, FILE]},
     {"op": "favorite", "item": ITEM},
     {"op": "album.add", "item": ITEM, "kind": "user", "album": "Trip"},
     {"op": "album.rename", "kind": "user", "album": "Trip", "to": "Trip 2"},
@@ -114,6 +116,13 @@ def test_well_formed_events_parse(fields):
     {k: v for k, v in IMPORT.items() if k != "files"},
     IMPORT | {"files": []},
     IMPORT | {"files": [{"role": "main", "name": "A.JPG"}]},
+    IMPORT | {"files": [{k: v for k, v in FILE.items() if k != "size"}]},
+    IMPORT | {"files": [FILE | {"size": "5"}]},
+    IMPORT | {"files": [FILE | {"size": True}]},
+    IMPORT | {"files": [FILE | {"size": -1}]},
+    IMPORT | {"files": [CLIP]},
+    IMPORT | {"files": [FILE, FILE | {"name": "B.JPG"}]},
+    IMPORT | {"files": [FILE | {"sha256": "c" * 64}]},
     IMPORT | {"files": ["A.JPG"]},
     IMPORT | {"item": "not-a-sha"},
     IMPORT | {"folder": 2024},

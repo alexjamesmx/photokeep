@@ -159,3 +159,13 @@ def test_roots_are_absolute_whatever_path_is_given(tmp_path, monkeypatch):
     made = init_library(Path("L"), "laptop")
     copy = init_copy(Path("M"), "drive", of=open_library(Path("L")))
     assert made.root == tmp_path / "L" == open_library(Path("L")).root and copy.root == tmp_path / "M"
+
+
+def test_init_warns_when_the_new_copy_shares_a_disk_with_the_library(tmp_path, capsys):
+    a = init_library(tmp_path / "A", "laptop")
+    assert main(["init", str(tmp_path / "L2"), "--name", "solo"]) == 0
+    assert capsys.readouterr().err == ""
+    assert main(["init", str(tmp_path / "B"), "--name", "drive", "--copy-of", str(a.root), "--json"]) == 0
+    out, err = capsys.readouterr()
+    assert json.loads(out)["library_id"] == a.library_id
+    assert err.startswith("photokeep: warning:") and "same disk" in err and "mounted" in err

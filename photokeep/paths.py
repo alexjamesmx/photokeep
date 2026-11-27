@@ -5,13 +5,23 @@ from typing import TypeGuard
 from photokeep.state import State
 
 PART = ".photokeep-part"  # suffix of copy_verified's temp files
+# What Finder and Explorer leave in the folders they show, compared casefolded; ._<name> is macOS's
+# AppleDouble file on drives without extended attributes.
+_JUNK = frozenset({".ds_store", "thumbs.db", "desktop.ini"})
 _FORBIDDEN = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _FOLDER = re.compile(r"[0-9]{4}/[0-9]{2}")
 _ID = re.compile(r"[0-9a-f]{64}")
 
 
+def os_junk(name: str) -> bool:
+    """True for a file an operating system drops into a folder; scan never sees one."""
+    return name.casefold() in _JUNK or name.startswith("._")
+
+
 def safe_name(name: str) -> str:
     cleaned = _FORBIDDEN.sub("_", unicodedata.normalize("NFC", name)).rstrip(". ")
+    if os_junk(cleaned):  # scan skips junk, so an original by that name would look missing for ever
+        cleaned = "_" + cleaned
     # scan deletes *.photokeep-part files as leftovers, so no original may end that way. Compared
     # casefolded because a case-insensitive drive would alias the temp file onto the original.
     if cleaned.casefold().endswith(PART):

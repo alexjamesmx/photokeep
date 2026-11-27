@@ -45,7 +45,7 @@ def metrics(thumb) -> dict:
     n = (g[:-2, :-2] - 2 * g[:-2, 1:-1] + g[:-2, 2:] - 2 * g[1:-1, :-2] + 4 * g[1:-1, 1:-1]
          - 2 * g[1:-1, 2:] + g[2:, :-2] - 2 * g[2:, 1:-1] + g[2:, 2:])
     noise = float(np.abs(n).sum() * np.sqrt(np.pi / 2) / (6 * n.size))
-    small = np.asarray(thumb.convert("L").resize((9, 8), Image.LANCZOS), dtype=np.int16)
+    small = np.asarray(thumb.convert("L").resize((9, 8), Image.Resampling.LANCZOS), dtype=np.int16)
     # Flat images (black frames, blank screens) all hash alike, so they get no hash.
     bits = (small[:, 1:] > small[:, :-1]).flatten()
     dhash = None if small.std() < 4 else f"{int(''.join('1' if b else '0' for b in bits), 2):016x}"
@@ -73,7 +73,8 @@ def _save_thumb(im, dst: Path):
     from PIL import Image
 
     r = min(THUMB_SHORT / min(im.size), THUMB_LONG_MAX / max(im.size), 1.0)
-    t = im.resize((max(1, round(im.width * r)), max(1, round(im.height * r))), Image.LANCZOS, reducing_gap=3.0)
+    t = im.resize((max(1, round(im.width * r)), max(1, round(im.height * r))), Image.Resampling.LANCZOS,
+                  reducing_gap=3.0)
     _atomic(dst, lambda tmp: t.save(tmp, "JPEG", quality=80, optimize=True))
     return t
 
@@ -82,6 +83,7 @@ def _render_photo(item_id: str, src: Path, ext: str, out_dir: Path) -> dict:
     from PIL import Image, ImageOps
 
     res = {}
+    im: Image.Image
     with tempfile.TemporaryDirectory() as tmp:
         if ext == ".heic":
             dec = Path(tmp) / "full.jpg"
@@ -104,7 +106,7 @@ def _render_photo(item_id: str, src: Path, ext: str, out_dir: Path) -> dict:
         res["preview"] = 0
         if ext == ".heic":
             p = im.copy()
-            p.thumbnail((PREVIEW_LONG, PREVIEW_LONG), Image.LANCZOS)
+            p.thumbnail((PREVIEW_LONG, PREVIEW_LONG), Image.Resampling.LANCZOS)
             _atomic(cache_path("previews", item_id, out_dir),
                     lambda t: p.save(t, "JPEG", quality=82, optimize=True, progressive=True))
             res["preview"] = 1
@@ -165,7 +167,6 @@ def similar_groups(rows: list[dict]) -> dict[str, tuple[str, int]]:
     h = np.array([int(r["dhash"], 16) for r in cand], dtype=np.uint64)
     t = np.array([_stamp(r["taken"]) for r in cand])
     shot = np.array([bool(r["screenshot"]) for r in cand])
-    pop = np.array([bin(i).count("1") for i in range(256)], dtype=np.uint8)
     parent = list(range(n))
 
     def find(x):
@@ -175,8 +176,7 @@ def similar_groups(rows: list[dict]) -> dict[str, tuple[str, int]]:
         return x
 
     for a in range(0, n, 512):
-        x = h[a:a + 512, None] ^ h[None, :]
-        d = pop[x.view(np.uint8)].reshape(x.shape[0], n, 8).sum(-1)
+        d = np.bitwise_count(h[a:a + 512, None] ^ h[None, :])  # Hamming distances of 512 rows to all (numpy 2)
         with np.errstate(invalid="ignore"):
             near = np.abs(t[a:a + 512, None] - t[None, :]) <= 120
         both_shots = shot[a:a + 512, None] & shot[None, :]

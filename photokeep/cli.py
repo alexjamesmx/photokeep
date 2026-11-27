@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sqlite3
 import sys
 import webbrowser
@@ -13,7 +14,7 @@ from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
 from photokeep.library import LibraryError, init_copy, init_library, open_library
 
-# Later tasks register their subcommand handlers here by name.
+# Subcommand handlers by name; build_parser gives each its subparser, with the docstring as help.
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 # Optional per-command argument definitions, keyed like COMMANDS.
 ARGUMENTS: dict[str, Callable[[argparse.ArgumentParser], None]] = {}
@@ -34,11 +35,13 @@ def _init_args(p: argparse.ArgumentParser) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     """Create a library, or a new copy of an existing one."""
     try:
-        if args.copy_of:
-            lib = init_copy(args.path, args.name, of=open_library(args.copy_of))
-        else:
-            lib = init_library(args.path, args.name)
+        of = open_library(args.copy_of) if args.copy_of else None
+        lib = init_copy(args.path, args.name, of=of) if of else init_library(args.path, args.name)
         appcopy.install(lib)
+        # A drive that is not mounted leaves its mount point on the laptop's disk: the "copy" would die with it.
+        if of and os.stat(lib.root).st_dev == os.stat(of.root).st_dev:
+            print(f"photokeep: warning: {lib.root} is on the same disk as {of.root}, so it is no backup of it; "
+                  "is the drive mounted?", file=sys.stderr)
     except (LibraryError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
@@ -86,6 +89,7 @@ def _sync_text(s: dict, dry_run: bool, update_app: bool) -> str:
     lines = [
         f"logs: {len(s['logs'])} files, {sum(size for *_, size in s['logs'])} bytes",
         f"files: {s['copy_a_to_b']} a->b, {s['copy_b_to_a']} b->a",
+        f"bytes: {s['bytes_a_to_b']} a->b, {s['bytes_b_to_a']} b->a",
         f"purges: {_some([p['item'][:12] for p in s['new_purges']])}",
         f"layout a: {_counts(s['layout_a'])}",
         f"layout b: {_counts(s['layout_b'])}",

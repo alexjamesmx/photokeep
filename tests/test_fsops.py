@@ -297,3 +297,20 @@ def test_a_full_disk_stops_the_layout(lib, monkeypatch):
     _refuse_moves_to(monkeypatch, "A.JPG", errno.ENOSPC)
     with pytest.raises(OSError, match="No space"):
         apply_layout(lib, plan_layout(lib, state, scan(lib)))
+
+
+JUNK = (".DS_Store", "._A.JPG", "Thumbs.db", "desktop.ini")
+
+
+def test_os_junk_is_never_scanned_moved_or_deleted(lib, jpeg):
+    put(lib, "originals/2024/01/A.JPG", jpeg)
+    for top in ("originals/2024/01", "trash", f"trash/{sha(jpeg)}"):
+        for name in JUNK:
+            put(lib, f"{top}/{name}", b"junk")
+    state = state_with(lib, jpeg, name="A.JPG", trashed=True)
+    assert scan(lib) == {sha(jpeg): ["originals/2024/01/A.JPG"]}
+    plan = plan_layout(lib, state, scan(lib))
+    assert plan.untracked == [] and plan.deletes == []
+    apply_layout(lib, plan)
+    for top in ("originals/2024/01", "trash", f"trash/{sha(jpeg)}"):
+        assert all((lib.root / top / name).read_bytes() == b"junk" for name in JUNK)

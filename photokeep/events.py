@@ -107,11 +107,20 @@ def _strings(d: dict, keys: Iterable[str]) -> bool:
     return all(isinstance(d.get(k), str) for k in keys)
 
 
+def _valid_file(f: object) -> bool:
+    if not isinstance(f, dict) or not _strings(f, _FILE_KEYS):
+        return False
+    size = f.get("size")
+    return isinstance(size, int) and not isinstance(size, bool) and size >= 0
+
+
 def _valid_import(e: dict) -> bool:
     files, fingerprint = e.get("files"), e.get("fingerprint")
-    return (_ID.fullmatch(e["item"]) is not None
-            and isinstance(files, list) and len(files) > 0
-            and all(isinstance(f, dict) and _strings(f, _FILE_KEYS) for f in files)
+    if not (isinstance(files, list) and all(_valid_file(f) for f in files)):
+        return False
+    # The item is its main file: layout, verify and status read each file's role, hash and size.
+    mains = [f for f in files if f["role"] == "main"]
+    return (_ID.fullmatch(e["item"]) is not None and len(mains) == 1 and mains[0]["sha256"] == e["item"]
             # fold turns the fingerprint into a dict key, so it must hold plain values only
             and (fingerprint is None or isinstance(fingerprint, list)
                  and not any(isinstance(x, list | dict) for x in fingerprint)))

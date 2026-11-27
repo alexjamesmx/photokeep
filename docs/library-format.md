@@ -35,7 +35,8 @@ Timestamps are UTC, `YYYY-MM-DDTHH:MM:SS.ffffffZ`. Both files are written atomic
 
 - Names are NFC-normalized, unique case-insensitively within a folder (compared as `safe_name(n).casefold()`), contain none of `< > : " / \ | ? *` or control characters, and have no trailing dot or space (exFAT).
 - Assignment iterates non-purged items sorted by `(first_ts, id)`. A file gets `safe_name(original)` if free, else `<stem>~<item id[:8]><ext>`. A Live clip follows the same rule independently.
-- A name freed by a purge is never reused within the same assignment run (purged items are skipped).
+- Purged items get no path, so a name a purge frees goes to the next item with that name by `(first_ts, id)`, and that item's file is renamed at the next sync or viewer change. A Live clip's name is freed the same way.
+- A name that looks like OS junk (`.DS_Store`, `._*`, `Thumbs.db`, `desktop.ini`, any case) gets a leading `_`: scan skips such files in `originals/` and `trash/`, and never copies, moves, deletes or reports them.
 
 ## Change log
 
@@ -46,7 +47,7 @@ Common keys: `v` (1), `id` (uuid4 hex), `ts` (UTC, as above), `copy` (author's c
 | op | fields |
 |---|---|
 | `copy.name` | `name` |
-| `import` | `item`, `import` (import id), `folder` (`YYYY/MM` or `undated`), `files` (list of `{role: "main"\|"live", name, sha256, size, mtime}`), `fingerprint` (`[taken, model, w, h]` or null), `version_of` (sha or null) |
+| `import` | `item`, `import` (import id), `folder` (`YYYY/MM` or `undated`), `files` (list of `{role: "main"\|"live", name, sha256, size, mtime}`, exactly one `main`, whose `sha256` is `item`), `fingerprint` (`[taken, model, w, h]` or null), `version_of` (sha or null) |
 | `favorite`, `unfavorite`, `hide`, `unhide`, `restore`, `readmit` | `item` |
 | `trash` | `item`, optional `reason` |
 | `purge` | `item`, optional `name` |

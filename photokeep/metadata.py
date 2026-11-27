@@ -1,6 +1,7 @@
 """Display metadata derived from a file's EXIF and the provider's export; never written back."""
 
 import re
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from pathlib import PurePath
 
@@ -9,13 +10,19 @@ NAME_RE = re.compile(r"(?<!\d)(\d{4})-(\d\d)-(\d\d)[ _](\d\d)\.(\d\d)\.(\d\d)(?!
 VIDEO_EXTS = {".mov", ".mp4"}
 
 
+def _datetime(fields: Sequence[str]) -> datetime:
+    """A datetime from six digit strings: year, month, day, hour, minute, second."""
+    year, month, day, hour, minute, second = map(int, fields)
+    return datetime(year, month, day, hour, minute, second)
+
+
 def _exif_date(value, offset=None) -> tuple[datetime | None, str | None]:
     """Wall-clock datetime and '+hh:mm' (or None) from an EXIF/QuickTime date string."""
     m = DATE_RE.match(str(value or ""))
     if not m or m.group(1) == "0000":
         return None, None
     try:
-        dt = datetime(*map(int, m.groups()[:6]))
+        dt = _datetime(m.groups()[:6])
     except ValueError:
         return None, None
     tz = m.group(7) or offset
@@ -44,9 +51,8 @@ def _name_date(name: str) -> datetime | None:
     m = NAME_RE.search(name)
     if not m:
         return None
-    parts = [g for g in m.groups() if g is not None]
     try:
-        return datetime(*map(int, parts))
+        return _datetime([g for g in m.groups() if g is not None])
     except ValueError:
         return None
 
@@ -99,5 +105,5 @@ def derive(exif: dict, provider: dict | None, name: str, mtime: str | None) -> d
 
 
 def fingerprint(meta: dict) -> tuple[str, str, int, int] | None:
-    key = (meta.get("taken"), meta.get("model"), meta.get("w"), meta.get("h"))
-    return key if all(key) else None
+    taken, model, w, h = meta.get("taken"), meta.get("model"), meta.get("w"), meta.get("h")
+    return (taken, model, w, h) if taken and model and w and h else None

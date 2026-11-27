@@ -12,7 +12,8 @@ Phones are planned (as a source of new photos, and as a consumer filled newest-f
 - Never lose or alter metadata: dates, places, camera, original names, and provider data under `sources/`.
 - Dry-run before anything destructive and show the summary to the owner.
 - Ask the owner before `--yes` on a sync that has deletes or purges, before `repair`, before deleting anything outside a library, and before `purge` or `readmit`.
-- Purge is final and there is no resurrection: a purged item is never re-imported unless the owner explicitly asks for `readmit`.
+- Purge is final and there is no resurrection: a purged item is never re-imported unless the owner explicitly asks for `readmit`. `readmit` is an event in the log format with no command yet: tell the owner, never write one by hand.
+- Never edit a log under `log/` by hand. Logs only grow, and only Photokeep appends to them.
 - Trash is global and lasts 30 days. A purge event is written at the next sync after that.
 - Every copy is equal. No copy is the master, and `copy.json` is never synced.
 - Never put personal data in the repo (names, emails, home paths, drive names, account names). Run `python3 scripts/check_private.py` before every commit; it must exit 0.
@@ -51,7 +52,7 @@ Design: [docs/architecture.md](docs/architecture.md). Decisions: [docs/decisions
 
 ## Development
 
-`uv sync`, then `uv run pytest -q`. The suite builds synthetic fixtures; there are no real photos. Core modules use only the standard library; `media.py` imports Pillow and numpy lazily (extra `media`).
+`uv sync`, then `uv run pytest -q` and `uv run mypy photokeep`; CI runs both. The suite builds synthetic fixtures; there are no real photos. Core modules use only the standard library; `media.py` imports Pillow and numpy lazily (extra `media`).
 
 Module map (`photokeep/`):
 

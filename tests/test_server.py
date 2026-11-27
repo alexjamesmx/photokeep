@@ -375,3 +375,11 @@ def test_cli_serve_refuses_a_bad_port(lib, port, capsys):
 def test_cli_serve_refuses_a_folder_that_is_no_library(tmp_path, capsys):
     assert main(["serve", str(tmp_path), "--no-browser"]) == 1
     assert "not a Photokeep library" in capsys.readouterr().err
+
+
+def test_every_answer_forbids_type_sniffing(served):
+    lib, client, item = served
+    for method, path in (("GET", "/"), ("GET", "/api/items"), ("GET", f"/o/{item}"), ("GET", "/nope"),
+                         ("POST", "/api/trash")):
+        _, headers, _ = client.request(method, path)
+        assert headers.get("X-Content-Type-Options") == "nosniff", path

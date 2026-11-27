@@ -23,4 +23,5 @@ jobs:
           python-version: ${{ matrix.python }}
       - run: uv sync
       - run: uv run pytest -q
+      - run: uv run mypy photokeep
       - run: python3 scripts/check_private.py

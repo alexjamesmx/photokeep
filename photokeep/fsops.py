@@ -7,7 +7,7 @@ from pathlib import Path
 
 from photokeep.hashcache import HashCache
 from photokeep.library import Library
-from photokeep.paths import PART, assign
+from photokeep.paths import PART, assign, os_junk
 from photokeep.state import State
 
 _CHUNK = 1 << 20
@@ -75,12 +75,13 @@ def copy_verified(src: Path, dst: Path, sha: str) -> None:
 
 
 def _files(folder: Path) -> Iterator[Path]:
-    # Regular files only: a symlink's bytes live elsewhere, and it may dangle.
+    # Regular files only: a symlink's bytes live elsewhere, and it may dangle. OS junk is the system's
+    # to keep, so it is never copied, moved, deleted or reported.
     with os.scandir(folder) as entries:
         for e in entries:
             if e.is_dir(follow_symlinks=False):
                 yield from _files(Path(e.path))
-            elif e.is_file(follow_symlinks=False):
+            elif e.is_file(follow_symlinks=False) and not os_junk(e.name):
                 yield Path(e.path)
 
 
@@ -92,7 +93,7 @@ def _hash(cache: HashCache, path: Path, rehash: bool = False) -> str | None:
 
 
 def scan(lib: Library, rehash: bool = False, cleanup: bool = True) -> dict[str, list[str]]:
-    """Map the SHA-256 of every file under originals/ and trash/ to its sorted relative paths.
+    """Map the SHA-256 of every file under originals/ and trash/, OS junk aside, to its sorted relative paths.
 
     Leftover copy_verified temp files are never reported; `cleanup` deletes them.
     """

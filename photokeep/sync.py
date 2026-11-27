@@ -57,6 +57,8 @@ class SyncPlan:
     sources_b_to_a: list[str] = field(default_factory=list)
     sources_conflicts: list[str] = field(default_factory=list)  # under sources/: different bytes, a symlink or not ours
     failed: Failures = field(default_factory=list)
+    bytes_a_to_b: int = 0  # what copy_a_to_b adds up to: the space it needs on b
+    bytes_b_to_a: int = 0
 
     def summary(self) -> dict:
         # Conflicts are counted where they stand last: after a run, in the fresh plans.
@@ -66,6 +68,8 @@ class SyncPlan:
             "new_purges": [{"item": item, "trashed_at": ts} for item, ts in self.new_purges],
             "copy_a_to_b": len(self.copy_a_to_b),
             "copy_b_to_a": len(self.copy_b_to_a),
+            "bytes_a_to_b": self.bytes_a_to_b,
+            "bytes_b_to_a": self.bytes_b_to_a,
             "layout_a": self.layout_a.summary(),
             "layout_b": self.layout_b.summary(),
             "missing_both": len(self.missing_both),
@@ -178,6 +182,11 @@ def _fills(layouts: tuple[LayoutPlan, LayoutPlan], found: tuple[Found, Found]) -
     return a_to_b, b_to_a, neither
 
 
+def _bytes(state: State, files: Files) -> int:
+    sizes = {f["sha256"]: f["size"] for item in state.items.values() for f in item.files}
+    return sum(sizes[sha] for sha, _ in files)
+
+
 def _app_version(lib: Library) -> str | None:
     try:
         text = (lib.app / "photokeep" / "__init__.py").read_text(encoding="utf-8")
@@ -208,7 +217,8 @@ def plan(a: Library, b: Library, now: datetime) -> SyncPlan:
     sources = sync_sources.compare(a, b)
     return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, _app(a, b), neither,
                     sources_a_to_b=list(sources.a_to_b), sources_b_to_a=list(sources.b_to_a),
-                    sources_conflicts=sources.conflicts)
+                    sources_conflicts=sources.conflicts,
+                    bytes_a_to_b=_bytes(state, a_to_b), bytes_b_to_a=_bytes(state, b_to_a))
 
 
 def _arrange(lib: Library, side: str, state: State) -> tuple[LayoutPlan, Failures]:
@@ -285,4 +295,5 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
     return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, layout_a, layout_b, app, neither, pending,
                     to_b.bad + to_a.bad + filled[0].bad + filled[1].bad, to_b.done, to_a.done,
                     sorted(sources.conflicts + to_b.conflicts + to_a.conflicts),
-                    to_b.failed + to_a.failed + moves_a + moves_b + filled[0].failed + filled[1].failed)
+                    to_b.failed + to_a.failed + moves_a + moves_b + filled[0].failed + filled[1].failed,
+                    _bytes(state, a_to_b), _bytes(state, b_to_a))

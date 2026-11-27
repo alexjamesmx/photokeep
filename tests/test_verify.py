@@ -184,3 +184,9 @@ def test_cli_verify_and_repair_with_relative_paths(a, b, monkeypatch):
     assert main(["verify", "B"]) == 0
     assert main(["repair", "A", "--from", "B"]) == 0
     assert main(["verify", "A"]) == 0 and files_of(a) == files_of(b)
+
+
+def test_os_junk_is_not_untracked(a):
+    add_item(a, b"photo", name="A.JPG")
+    put(a, "originals/2024/01/Thumbs.db", b"explorer")
+    assert verify(a).ok

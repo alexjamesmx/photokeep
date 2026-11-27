@@ -33,8 +33,9 @@ def ev(op: str, item: str | None = None, *, ts: str = T1, copy: str = "c1", **fi
 
 def imp(item: str, *, name: str = "IMG_1.JPG", folder: str = "2024/01", ts: str = T0,
         copy: str = "c1", fingerprint: list | None = None, live: str | None = None,
-        live_sha: str | None = None, version_of: str | None = None, import_id: str | None = None) -> dict:
-    files = [{"role": "main", "name": name, "sha256": item, "size": 1, "mtime": ts}]
+        live_sha: str | None = None, version_of: str | None = None, import_id: str | None = None,
+        size: int = 1) -> dict:
+    files = [{"role": "main", "name": name, "sha256": item, "size": size, "mtime": ts}]
     if live:
         files.append({"role": "live", "name": live, "sha256": live_sha or uuid.uuid4().hex, "size": 1, "mtime": ts})
     return ev("import", item, ts=ts, copy=copy, **{"import": import_id or uuid.uuid4().hex}, folder=folder,
@@ -78,7 +79,8 @@ def add_item(lib: Library, data: bytes, *, name: str = "IMG_1.JPG", folder: str 
     """Import `data` on lib as the importer would: file under originals/ plus an import event."""
     put(lib, f"originals/{folder}/{name}", data)
     item = sha(data)
-    events.append(lib, [imp(item, name=name, folder=folder, ts=ts, copy=lib.copy_id, import_id=import_id)])
+    events.append(lib, [imp(item, name=name, folder=folder, ts=ts, copy=lib.copy_id, import_id=import_id,
+                            size=len(data))])
     return item
 
 
