@@ -281,9 +281,10 @@ def _migrate_args(p: argparse.ArgumentParser) -> None:
 
 
 def _migrate_text(s: dict, dry_run: bool) -> str:
-    lines = [f"{what.replace('_', ' ')}: {n}" for what, n in s.items() if what != "problems"]
+    lines = [f"{what.replace('_', ' ')}: {n}" for what, n in s.items() if what not in ("merged", "problems")]
+    merged = [f"{m['source']} into row {m['into']}" for m in s["merged"]]
     problems = [f"{p['source']}: {p['problem']}" for p in s["problems"]]
-    lines.append(f"problems: {_some(problems)}")
+    lines += [f"merged: {_some(merged)}", f"problems: {_some(problems)}"]
     if dry_run:
         lines.append("dry run: nothing changed; run again without --dry-run to migrate")
     return "\n".join(lines)

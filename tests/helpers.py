@@ -85,9 +85,10 @@ def add_item(lib: Library, data: bytes, *, name: str = "IMG_1.JPG", folder: str 
 def add_source(lib: Library, import_id: str, files: dict[str, bytes], *, exif: list[dict] = (),
                dates: dict[str, str] | None = None, adapter: str | None = "icloud") -> None:
     """Write sources/<import_id>/ as an iCloud import keeps it: manifest.json for `files` (source path -> bytes),
-    exiftool's exif.json, and a part1 Photo Details CSV giving each name in `dates` its Apple-format date."""
+    exiftool's exif.json (run on raw/), and a part1 Photo Details CSV giving each name in `dates` its Apple-format
+    date."""
     entries = [{"source_path": p, "sha256": sha(d), "size": len(d), "mtime": None} for p, d in files.items()]
-    manifest = {"import": import_id, "files": entries} | ({"adapter": adapter} if adapter else {})
+    manifest = {"import": import_id, "exif_root": "raw", "files": entries} | ({"adapter": adapter} if adapter else {})
     put(lib, f"sources/{import_id}/manifest.json", json.dumps(manifest).encode())
     put(lib, f"sources/{import_id}/exif.json", json.dumps(list(exif)).encode())
     if dates:

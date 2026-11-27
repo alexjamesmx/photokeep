@@ -14,11 +14,16 @@ Needs:
    ```
    Success: exit 0.
 2. Check free space on the destination is above the library's size. Stop and ask if unsure.
-3. Dry run (changes nothing, still hashes everything, takes minutes):
+3. Ask the owner to stop the prototype's viewer, so nothing changes the prototype while it is read. Then dry run (changes nothing, still hashes everything, takes minutes):
    ```
    photokeep migrate-v0 <old> <new-copy> --raw <raw> --zip <zip>... --dry-run --json
    ```
-   Success: exit 0 and `problems` empty. Progress goes to stderr. Check the counts (`items`, `trashed`, `favorites`, `album_links`, `tombstones`) against what the owner expects. Exit 2 lists `problems`: show them to the owner and stop.
+   Progress goes to stderr. Exit 2 lists `problems`: show them to the owner and stop. On exit 0, check before going on, and stop and ask the owner if any is off:
+   - `items`, `trashed`, `favorites`, `album_links`, `tombstones` match what the owner expects.
+   - `exif_matched` and `provider_matched` are close to `items`: each item found its exiftool record and its Photo Details row. Far lower means the metadata was not matched and dates and fingerprints would be lost.
+   - `date_differs_from_prototype` is 0 or close to it: dates the prototype showed, compared to the minute.
+   - `clip_name_guessed` is small: Live Photo clips whose original name was not found by their ContentIdentifier.
+   - `merged` lists rows with the same bytes as another row; they become one item with all their marks. It needs no action.
 4. Run it for real, with the same arguments and no `--dry-run`:
    ```
    photokeep migrate-v0 <old> <new-copy> --raw <raw> --zip <zip>... --json

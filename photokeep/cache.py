@@ -74,10 +74,10 @@ def _json(path: Path, missing):
         return None
 
 
-def exif_key(source_file: str, import_id: str) -> str:
-    """exiftool's SourceFile as a manifest source_path: without the folder exiftool ran in (raw/ or the import's)."""
+def exif_key(source_file: str, top: str) -> str:
+    """exiftool's SourceFile as a manifest source_path: without the folder exiftool ran on (top), and all before it."""
     parts = PurePosixPath(source_file).parts
-    cut = next((i + 1 for i, part in enumerate(parts[:-1]) if part in ("raw", import_id)), 0)
+    cut = next((i + 1 for i, part in enumerate(parts[:-1]) if part == top), 0)
     return "/".join(parts[cut:])
 
 
@@ -106,13 +106,16 @@ def _import_sources(folder: Path) -> _Read:
     records = _json(folder / "exif.json", [])
     provider = _provider(folder, _adapter(manifest, folder.name))
     errors = int(not isinstance(records, list)) + int(provider is None)
-    exif = {exif_key(str(r.get("SourceFile", "")), folder.name): r
+    top = _str(manifest.get("exif_root")) or folder.name
+    exif = {exif_key(str(r.get("SourceFile", "")), top): r
             for r in (records if isinstance(records, list) else []) if isinstance(r, dict)}
     provider = provider or {}
-    files = {f["sha256"]: _Source(f["source_path"], _str(f.get("mtime")), exif.get(f["source_path"], {}),
-                                  provider.get(f["source_path"]))
-             for f in manifest["files"]
-             if isinstance(f, dict) and isinstance(f.get("sha256"), str) and isinstance(f.get("source_path"), str)}
+    files: dict[str, _Source] = {}
+    for f in manifest["files"]:
+        if isinstance(f, dict) and isinstance(f.get("sha256"), str) and isinstance(f.get("source_path"), str):
+            # The first entry of a SHA-256 holds the name its import kept; later ones name duplicates of it.
+            files.setdefault(f["sha256"], _Source(f["source_path"], _str(f.get("mtime")),
+                                                  exif.get(f["source_path"], {}), provider.get(f["source_path"])))
     return files, errors
 
 

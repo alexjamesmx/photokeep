@@ -14,6 +14,7 @@ from contextlib import closing, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
+from typing import NamedTuple
 
 from photokeep import __version__, events, fsops, zipscan
 from photokeep.cache import Cache, exif_key, regular
@@ -34,18 +35,27 @@ class MigrationError(Exception):
     pass
 
 
+class _Match(NamedTuple):
+    """How much of the export's metadata an item was matched with: what the dry run shows before anything is kept."""
+    exif: bool  # exiftool has a record of the main file
+    provider: bool  # Photo Details has a row for it
+    clip_guessed: bool  # the clip's name was not found by its ContentIdentifier
+    date_differs: bool  # the date shown differs from the prototype's, to the minute
+
+
 @dataclass
 class _Item:
     row: dict  # the prototype row whose files, date and thumbnails are kept
     folder: str
     files: list[dict]  # as the import event lists them
     old: dict[str, Path]  # role -> the file in the prototype
-    sources: list[dict]  # manifest entries
+    sources: list[dict]  # manifest entries of every row merged into the item, the kept row's first
     fingerprint: list | None
     favorite: bool
     hidden: bool
     albums: list[tuple[str, str]]  # (kind, title)
     trashed: bool
+    match: _Match
 
     @property
     def id(self) -> str:
@@ -71,13 +81,13 @@ def _rows(db_path: Path) -> list[dict]:
         return [dict(r) for r in db.execute("SELECT * FROM items ORDER BY id")]
 
 
-def _exif(raw_dir: Path, import_id: str) -> dict[str, dict]:
+def _exif(raw_dir: Path) -> dict[str, dict]:
     """exiftool's records by source path (partN/Photos/<name>), keyed as the cache will read them from sources/."""
     path = raw_dir.parent / "exif.json"
     if not raw_dir.is_dir() or not path.is_file():
         raise MigrationError(f"{raw_dir} must be the export's raw/ folder, with exif.json beside it")
     try:
-        return {exif_key(r["SourceFile"], import_id): r for r in json.loads(path.read_bytes())}
+        return {exif_key(r["SourceFile"], raw_dir.name): r for r in json.loads(path.read_bytes())}
     except (ValueError, TypeError, KeyError) as e:  # bad JSON, or not a list of records with a SourceFile
         raise MigrationError(f"{path} is not exiftool -j output ({type(e).__name__}: {e})") from None
 
@@ -92,14 +102,35 @@ def _titles(row: dict, col: str) -> list[str]:
     raise MigrationError(f"row {row['id']}: {col} is not a JSON list of titles")
 
 
-def _clips(exif: dict[str, dict]) -> dict[tuple[str, str], str]:
-    """Live Photo clips by (folder, ContentIdentifier): Apple gives a photo and its clip the same identifier."""
-    out: dict[tuple[str, str], str] = {}
+def _clips(exif: dict[str, dict]) -> dict[str, list[str]]:
+    """Videos by ContentIdentifier: Apple gives a photo and its Live Photo clip the same identifier."""
+    out: dict[str, list[str]] = {}
     for key in sorted(exif):
         cid = exif[key].get("ContentIdentifier")
         if cid and PurePosixPath(key).suffix.lower() in VIDEO_EXTS:
-            out.setdefault((key.rpartition("/")[0], cid), key)
+            out.setdefault(cid, []).append(key)
     return out
+
+
+def _clip_source(photo: str, live: str, exif: dict, clips: dict[str, list[str]]) -> tuple[str, bool]:
+    """The clip's source path, and whether it is a guess. An export can put a photo and its clip in different
+    parts, so every part is searched, the photo's own folder first: the prototype paired them there."""
+    folder, _, name = photo.rpartition("/")
+    found = clips.get(exif.get(photo, {}).get("ContentIdentifier"), [])
+    if found:
+        return min(found, key=lambda key: (key.rpartition("/")[0] != folder, key)), False
+    return f"{folder}/{PurePosixPath(name).stem}{PurePosixPath(live).suffix.upper()}", True
+
+
+def _row_files(row: dict, root: Path, exif: dict, clips: dict) -> list[tuple[str, str, Path, bool]]:
+    """(role, source path, file in the prototype, name guessed) for each file of a row."""
+    part, name = row["orig"].split("/", 1)
+    source = f"{part}/Photos/{name}"
+    files = [("main", source, root / row["path"], False)]
+    if row["live"]:
+        clip, guessed = _clip_source(source, row["live"], exif, clips)
+        files.append(("live", clip, root / row["live"], guessed))
+    return files
 
 
 def _sha_size(path: Path) -> tuple[str, int] | None:
@@ -141,34 +172,37 @@ def _kept(group: list[dict]) -> dict:
 
 def _item(group: list[dict], root: Path, hashed: dict, exif: dict, clips: dict, provider: dict) -> _Item:
     row = _kept(group)
-    part, name = row["orig"].split("/", 1)
-    source = f"{part}/Photos/{name}"
-    roles = [("main", source, root / row["path"])]
-    if row["live"]:
-        cid = exif.get(source, {}).get("ContentIdentifier")
-        guess = f"{part}/Photos/{PurePosixPath(name).stem}{PurePosixPath(row['live']).suffix.upper()}"
-        roles.append(("live", clips.get((f"{part}/Photos", cid), guess), root / row["live"]))
-    files, sources = [], []
-    for role, src, path in roles:
-        digest, size = hashed[path]
-        files.append({"role": role, "name": src.rpartition("/")[2], "sha256": digest, "size": size, "mtime": None})
-        sources.append({"source_path": src, "sha256": digest, "size": size, "mtime": None})
+    # The kept row's names first: a reader of the manifest takes the first entry of each SHA-256.
+    named = [_row_files(r, root, exif, clips) for r in [row, *(r for r in group if r is not row)]]
+    kept = named[0]
+    files = [{"role": role, "name": src.rpartition("/")[2], "sha256": hashed[path][0], "size": hashed[path][1],
+              "mtime": None} for role, src, path, _ in kept]
+    sources = [{"source_path": src, "sha256": hashed[path][0], "size": hashed[path][1], "mtime": None}
+               for each in named for _, src, path, _ in each]
     folder = f"{(row['taken'] or '')[:4]}/{(row['taken'] or '')[5:7]}"
-    fp = fingerprint(derive(exif.get(source, {}), provider.get(source), name, None))
+    source = kept[0][1]  # the main file's
+    meta = derive(exif.get(source, {}), provider.get(source), source.rpartition("/")[2], None)
+    fp = fingerprint(meta)
+    # The prototype showed the same dates, CSV ones to the minute: a difference means something was misread.
+    match = _Match(source in exif, source in provider, any(guessed for *_, guessed in kept),
+                   (meta["taken"] or "")[:16] != (row["taken"] or "")[:16])
     albums: set[tuple[str, str]] = set()
     for r in group:
         albums |= {("album", t) for t in _titles(r, "albums")} | {("memory", t) for t in _titles(r, "memories")}
-    return _Item(row, folder if valid_folder(folder) else "undated", files, {r: p for r, _, p in roles}, sources,
-                 list(fp) if fp else None, any(r["favorite"] for r in group), any(r["hidden"] for r in group),
-                 sorted(albums), all(r["trashed"] for r in group))
+    return _Item(row, folder if valid_folder(folder) else "undated", files,
+                 {role: path for role, _, path, _ in kept}, sources, list(fp) if fp else None,
+                 any(r["favorite"] for r in group), any(r["hidden"] for r in group), sorted(albums),
+                 all(r["trashed"] for r in group), match)
 
 
 def _source(row: dict) -> str:
     return f"row {row['id']} ({row['path']})"
 
 
-def _items(rows: list[dict], root: Path, hashed: dict, exif: dict, provider: dict, problems: list) -> list[_Item]:
-    """One item per distinct main file; rows that cannot be migrated as they are become problems."""
+def _items(rows: list[dict], root: Path, hashed: dict, exif: dict, provider: dict,
+           problems: list) -> tuple[list[_Item], list[dict]]:
+    """One item per distinct main file, and the rows merged into another with the same bytes; rows that
+    cannot be migrated as they are become problems."""
     groups: dict[str, list[dict]] = {}
     for row in rows:
         if problem := _problem(row, root, hashed):
@@ -177,14 +211,15 @@ def _items(rows: list[dict], root: Path, hashed: dict, exif: dict, provider: dic
             groups.setdefault(row["sha256"], []).append(row)
     clips = _clips(exif)
     items = [_item(group, root, hashed, exif, clips, provider) for group in groups.values()]
+    merged = []
     for it, group in zip(items, groups.values()):
         kept = {f["sha256"] for f in it.files}
         for r in (r for r in group if r is not it.row):
-            problems.append({"source": _source(r), "problem": f"same bytes as row {it.row['id']}; merged into it"})
+            merged.append({"source": _source(r), "into": it.row["id"]})
             if r["live"] and hashed[root / r["live"]][0] not in kept:
                 problems.append({"source": _source(r), "problem": f"live clip {r['live']} not migrated "
                                                                   f"(duplicate of row {it.row['id']})"})
-    return items
+    return items, merged
 
 
 def _tombstones(members: list[tuple[Path, str]], known: set[str], say: Say, problems: list) -> dict[str, str]:
@@ -267,7 +302,17 @@ def _import_id(dest: Library, db_path: Path) -> str:
     return found[0] if found else f"{datetime.now():%Y-%m-%d}-icloud-{tag}"
 
 
-def _write_sources(dest: Library, import_id: str, raw_dir: Path, items: list[_Item]) -> None:
+def _manifest_files(items: list[_Item], paths: dict[str, dict[str, str]]) -> list[dict]:
+    """Every source file of every migrated row, with the library path its bytes got (None: not imported)."""
+    out = []
+    for it in items:
+        placed = {f["sha256"]: paths[it.id][f["role"]] for f in it.files}
+        out += [s | {"path": placed.get(s["sha256"])} for s in it.sources]
+    return out
+
+
+def _write_sources(dest: Library, import_id: str, raw_dir: Path, items: list[_Item],
+                   paths: dict[str, dict[str, str]]) -> None:
     final = dest.sources / import_id
     if final.exists():
         return  # complete: an interrupted run moved it into place in one step
@@ -278,8 +323,9 @@ def _write_sources(dest: Library, import_id: str, raw_dir: Path, items: list[_It
         fsops.copy_verified(path, stage / path.relative_to(raw_dir), file_sha256(path))
     exif = raw_dir.parent / "exif.json"
     fsops.copy_verified(exif, stage / "exif.json", file_sha256(exif))
+    # exif_root: the folder exiftool ran on, which every SourceFile in exif.json starts with
     manifest = {"import": import_id, "adapter": "icloud", "tool": f"photokeep {__version__} migrate-v0",
-                "files": [s for it in items for s in it.sources]}
+                "exif_root": raw_dir.name, "files": _manifest_files(items, paths)}
     with open(stage / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=1)
         f.flush()
@@ -296,13 +342,18 @@ def _refuse_overlap(dest: Library, old_root: Path, raw_dir: Path) -> None:
                                  "and its export")
 
 
-def _summary(items: list[_Item], tombstones: dict[str, str], problems: list[dict]) -> dict:
+def _summary(items: list[_Item], tombstones: dict[str, str], merged: list[dict], problems: list[dict]) -> dict:
     kinds = [kind for it in items for kind, _ in it.albums]
     return {"items": len(items), "trashed": sum(it.trashed for it in items),
             "live_clips": sum(len(it.files) > 1 for it in items), "tombstones": len(tombstones),
             "favorites": sum(it.favorite for it in items), "hidden": sum(it.hidden for it in items),
             "album_links": kinds.count("album"), "memory_links": kinds.count("memory"),
-            "copied_bytes": sum(f["size"] for it in items for f in it.files), "problems": problems}
+            "copied_bytes": sum(f["size"] for it in items for f in it.files),
+            "exif_matched": sum(it.match.exif for it in items),
+            "provider_matched": sum(it.match.provider for it in items),
+            "clip_name_guessed": sum(it.match.clip_guessed for it in items),
+            "date_differs_from_prototype": sum(it.match.date_differs for it in items),
+            "merged": merged, "problems": problems}
 
 
 def migrate(old_root: Path, raw_dir: Path, zips: list[Path], dest: Library, dry_run: bool,
@@ -324,17 +375,18 @@ def migrate(old_root: Path, raw_dir: Path, zips: list[Path], dest: Library, dry_
                 "verify fails, delete that copy's folder and migrate into a new one (the prototype is untouched)")
         rows = _rows(db_path)
         import_id = _import_id(dest, db_path)
-        exif, members = _exif(raw_dir, import_id), zipscan.members(zips, skip=_NOT_MEDIA)
+        exif, members = _exif(raw_dir), zipscan.members(zips, skip=_NOT_MEDIA)
         hashed = _hash_files(sorted({old_root / r[c] for r in rows for c in ("path", "live") if r[c]}), say)
         problems: list[dict] = []
-        items = _items(rows, old_root, hashed, exif, icloud.read(raw_dir), problems)
+        items, merged = _items(rows, old_root, hashed, exif, icloud.read(raw_dir), problems)
         known = {r["sha256"] for r in rows} | {h[0] for h in hashed.values() if h}
         tombstones = _tombstones(members, known, say, problems)
         if not dry_run:
             new = _events(dest, import_id, items, tombstones, datetime.now(UTC))
-            _place(dest, items, assign(fold(events.ordered([*events.read_all(dest), *new]))), say)
+            paths = assign(fold(events.ordered([*events.read_all(dest), *new])))
+            _place(dest, items, paths, say)
             _seed_cache(old_root, dest, items, say)
-            _write_sources(dest, import_id, raw_dir, items)
+            _write_sources(dest, import_id, raw_dir, items, paths)
             events.append(dest, new)
             Cache(dest).refresh(render=False)
-    return _summary(items, tombstones, problems)
+    return _summary(items, tombstones, merged, problems)

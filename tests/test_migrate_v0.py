@@ -40,8 +40,11 @@ def test_summary_counts(tmp_path, lib):
     size = sum((v.root / p).stat().st_size for p in ("2024/2024-03/2024-03-05 10.00.00.jpg",
                                                      "2024/2024-03/2024-03-05 10.00.00.mov",
                                                      ".library/trash/2.jpg", "Undated/IMG_0003.JPG"))
+    # B's and C's dates differ: the fixture's prototype gave B another day and C none
     assert run(v, lib) == {"items": 3, "trashed": 1, "live_clips": 1, "tombstones": 1, "favorites": 1, "hidden": 1,
-                           "album_links": 2, "memory_links": 1, "copied_bytes": size, "problems": []}
+                           "album_links": 2, "memory_links": 1, "copied_bytes": size, "exif_matched": 3,
+                           "provider_matched": 3, "clip_name_guessed": 0, "date_differs_from_prototype": 2,
+                           "merged": [], "problems": []}
 
 
 def test_marks_reach_the_viewer(tmp_path, lib):
@@ -90,10 +93,12 @@ def test_sources_hold_the_export_metadata(tmp_path, lib):
         assert (folder / rel).read_bytes() == (v.raw / rel).read_bytes()
     assert (folder / "exif.json").read_bytes() == (v.raw.parent / "exif.json").read_bytes()
     manifest = json.loads((folder / "manifest.json").read_text())
-    assert manifest["import"] == folder.name and manifest["adapter"] == "icloud"
+    assert (manifest["import"], manifest["adapter"], manifest["exif_root"]) == (folder.name, "icloud", "raw")
     clip = (v.root / "2024/2024-03/2024-03-05 10.00.00.mov").read_bytes()
     assert {"source_path": "part1/Photos/IMG_0001.mov", "sha256": v.shas["clip"], "size": len(clip),
-            "mtime": None} in manifest["files"]
+            "mtime": None, "path": "originals/2024/03/IMG_0001.mov"} in manifest["files"]
+    assert {f["source_path"]: f["path"] for f in manifest["files"]}["part1/Photos/IMG_0002.JPG"] == \
+        f"trash/{v.shas['b']}/IMG_0002.JPG"
     assert sorted(f["source_path"] for f in manifest["files"]) == [
         "part1/Photos/IMG_0001.JPG", "part1/Photos/IMG_0001.mov", "part1/Photos/IMG_0002.JPG",
         "part2/Photos/IMG_0003.JPG"]
@@ -179,11 +184,18 @@ def test_duplicates_merge_and_bad_rows_are_skipped(tmp_path, lib):
     gone = v.add(None, "Undated/IMG_0006.JPG", "part2/IMG_0006.JPG", sha256="1" * 64)
     summary = run(v, lib)
     assert summary["items"] == 3
-    assert [p["source"].split()[1] for p in summary["problems"]] == [str(bad), str(gone), str(dup)]
+    assert [p["source"].split()[1] for p in summary["problems"]] == [str(bad), str(gone)]
+    assert summary["merged"] == [{"source": f"row {dup} (Undated/IMG_0004.JPG)", "into": 3}]
     item = fold(read_all(lib)).items[v.shas["c"]]
     assert (item.favorite, item.hidden) == (True, True)
     assert item.albums == {("album", "Trip"), ("album", "Other"), ("memory", "Winter")}
     assert verify(lib).ok
+    (folder,) = lib.sources.iterdir()
+    entries = [f for f in json.loads((folder / "manifest.json").read_text())["files"] if f["sha256"] == item.id]
+    assert [(f["source_path"], f["path"]) for f in entries] == [
+        ("part2/Photos/IMG_0003.JPG", "originals/undated/IMG_0003.JPG"),
+        ("part2/Photos/IMG_0004.JPG", "originals/undated/IMG_0003.JPG")]
+    assert Cache(lib).item_json(item.id)["o"] == "part2/Photos/IMG_0003.JPG"  # the name the item kept
 
 
 def test_duplicate_with_a_clip_is_the_one_kept(tmp_path, lib):
@@ -195,9 +207,12 @@ def test_duplicate_with_a_clip_is_the_one_kept(tmp_path, lib):
     item = fold(read_all(lib)).items[v.shas["c"]]
     assert {f["role"]: f["name"] for f in item.files} == {"main": "IMG_0004.JPG", "live": "IMG_0004.MOV"}
     assert (lib.originals / "undated/IMG_0004.MOV").read_bytes() == b"clip 4"
-    assert {"source": f"row {other} (Undated/IMG_0005.JPG)",
-            "problem": f"live clip Undated/IMG_0005.mov not migrated (duplicate of row {kept})"} in summary["problems"]
+    assert summary["problems"] == [{"source": f"row {other} (Undated/IMG_0005.JPG)",
+                                    "problem": f"live clip Undated/IMG_0005.mov not migrated (duplicate of row {kept})"}]
     assert (summary["items"], summary["live_clips"]) == (3, 2) and verify(lib).ok
+    (folder,) = lib.sources.iterdir()
+    lost = {f["source_path"]: f for f in json.loads((folder / "manifest.json").read_text())["files"]}["part2/Photos/IMG_0005.MOV"]
+    assert (lost["sha256"], lost["path"]) == (sha(b"clip 5"), None)  # listed, though its bytes were not imported
 
 
 def test_first_duplicate_in_the_trash_is_not_the_one_kept(tmp_path, lib):
@@ -273,8 +288,49 @@ def test_clip_without_identifier_is_named_after_its_photo(tmp_path, lib):
     v = make_v0(tmp_path)
     v.add(jpeg_bytes((5, 5, 5)), "2024/2024-04/a.jpg", "part2/IMG_0007.HEIC", clip=b"clip 7",
           live="2024/2024-04/a.mov", taken="2024-04-01T08:00:00")
-    run(v, lib)
+    assert run(v, lib)["clip_name_guessed"] == 1
     assert (lib.originals / "2024/04/IMG_0007.MOV").read_bytes() == b"clip 7"
+
+
+def _add_exif(v, *records):
+    path = v.raw.parent / "exif.json"
+    path.write_text(json.dumps(json.loads(path.read_text()) + list(records)))
+
+
+def test_clip_is_found_by_its_identifier_in_another_part(tmp_path, lib):
+    v = make_v0(tmp_path)
+    v.add(jpeg_bytes((5, 5, 5)), "2024/2024-04/a.jpg", "part2/IMG_0007.HEIC", clip=b"clip 7",
+          live="2024/2024-04/a.mov", taken="2024-04-01T08:00:00")
+    _add_exif(v, {"SourceFile": "raw/part2/Photos/IMG_0007.HEIC", "ContentIdentifier": "CID-7"},
+              {"SourceFile": "raw/part3/Photos/IMG_0123.MOV", "ContentIdentifier": "CID-7"})
+    assert run(v, lib)["clip_name_guessed"] == 0
+    assert (lib.originals / "2024/04/IMG_0123.MOV").read_bytes() == b"clip 7"
+
+
+def test_raw_folder_of_any_name_is_matched(tmp_path, lib, mexico):
+    v = make_v0(tmp_path)
+    moved = v.raw.with_name("extracted")
+    v.raw.rename(moved)
+    v.raw = moved
+    exif = v.raw.parent / "exif.json"
+    exif.write_text(exif.read_text().replace('"raw/', '"extracted/'))
+    s = run(v, lib)
+    assert (s["exif_matched"], s["provider_matched"]) == (3, 3)
+    a = fold(read_all(lib)).items[v.shas["a"]]
+    assert a.fingerprint == ("2024-03-05T10:00:00", "iPhone 15", 8, 8)
+    assert Cache(lib).item_json(a.id)["cam"] == "Apple iPhone 15"
+
+
+def test_dates_are_compared_with_the_prototypes_to_the_minute(tmp_path, lib, mexico):
+    v = make_v0(tmp_path)
+    # the prototype showed the CSV's UTC date in local time (UTC-6), and wrote no seconds for it
+    v.add(jpeg_bytes((3, 3, 3)), "2024/2024-03/x.jpg", "part3/IMG_0030.JPG", taken="2024-03-05T10:00:00")
+    _write_details(v, "part3", "IMG_0030.JPG,x,no,no,no,\"Tuesday March 5,2024 4:00 PM GMT\",0\n")
+    # a photo with only EXIF CreateDate: the prototype read it as UTC, which it is not
+    v.add(jpeg_bytes((2, 2, 2)), "2024/2024-03/y.jpg", "part3/IMG_0031.JPG", taken="2024-03-05T04:00:00")
+    _add_exif(v, {"SourceFile": "raw/part3/Photos/IMG_0031.JPG", "CreateDate": "2024:03:05 10:00:00",
+                  "MIMEType": "image/jpeg"})
+    assert run(v, lib, dry_run=True)["date_differs_from_prototype"] == 2 + 1  # B and C, then IMG_0031
 
 
 def test_cli_dry_run_prints_json_and_progress(tmp_path, lib, capsys):
@@ -294,6 +350,7 @@ def test_cli_text_lists_problems_and_exits_2(tmp_path, lib, capsys):
     out = capsys.readouterr().out
     assert code == 2
     assert "items: 3" in out and f"problems: 1 (row {gone} (Undated/IMG_0006.JPG): file missing" in out
+    assert "exif matched: 3\n" in out and "date differs from prototype: 2\n" in out and "merged: 0\n" in out
     assert "dry run: nothing changed" in out
 
 
@@ -303,3 +360,11 @@ def test_cli_with_relative_paths(tmp_path, lib, monkeypatch):
     rel = [str(p.relative_to(tmp_path)) for p in (v.root, lib.root, v.raw, v.zip)]
     assert main(["migrate-v0", rel[0], rel[1], "--raw", rel[2], "--zip", rel[3]]) == 0
     assert main(["verify", rel[1]]) == 0
+
+
+def _write_details(v, part, rows):
+    from tests.helpers import DETAILS_HEADER
+
+    path = v.raw / part / "Photos/Photo Details.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes((DETAILS_HEADER + rows).encode("utf-8-sig"))
