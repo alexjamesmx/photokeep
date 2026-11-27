@@ -1,5 +1,6 @@
 """Import folders, sources/<import id>/: a provider's files kept verbatim, exiftool's records of the media
-(exif.json) and manifest.json. Each is written whole or not at all and never changed after; sync only adds files.
+(exif.json) and manifest.json. An import writes each whole or not at all, and it is never changed after; sync copies
+its files one by one, only adding them, so a copy may hold part of one until a sync finishes.
 """
 import json
 import os

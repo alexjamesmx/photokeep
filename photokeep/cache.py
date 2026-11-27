@@ -29,7 +29,7 @@ from photokeep.providers import icloud, takeout
 from photokeep.state import TRASH_DAYS, Item, State, fold
 
 PROVIDERS = {"icloud": icloud.read, "takeout": takeout.read}
-_ADAPTER = re.compile(r"\d{4}-\d\d-\d\d-([a-z0-9]+)-")  # import id: YYYY-MM-DD-<adapter>-<short random>
+_ADAPTER = re.compile(r"\d{4}-\d\d-\d\d-([a-z0-9]+)-")  # import id: YYYY-MM-DD-<adapter>-<hex tag of the listing>
 _MEDIA = ("w", "h", "sharp", "bright", "noise", "dhash", "thumb", "preview", "error")
 _COLUMNS = ("id", "n", "dir", "k", "sc", "s", "w", "h", "d", "c", "lc", "lv", "t", "z", "ds", "cam", "la", "lo",
             "f", "hi", "al", "me", "o", "g", "b", "tr", "ta", "r")

@@ -70,7 +70,7 @@ Common keys: `v` (1), `id` (uuid4 hex), `ts` (UTC, as above), `copy` (author's c
 
 - `import`, `adapter`, `tool` (the Photokeep version that wrote it).
 - `exif_root`: the folder exiftool ran on; every `SourceFile` in `exif.json` is `<exif_root>/<source_path>`.
-- `files`: one `{source_path, sha256, size, mtime, path}` per media file the import settled. `path` is the library path of those bytes when the import wrote them or the library already held them, null when the library had deleted them. A file that could not be read is not listed; a later run imports it under a new import id. `mtime` is null when the source has no real date (a Takeout zip).
+- `files`: one `{source_path, sha256, size, mtime, path}` per media file the import settled. `path` is the library path of those bytes when the import wrote them or the library already held them, null when the library had deleted them or for a clip listed in `problems` as `clip not in library`. A file that could not be read is not listed; a later run imports it under a new import id. `mtime` is null when the source has no real date (a Takeout zip).
 
 A provider reader (`providers/<adapter>.py`) turns these files into display metadata. An import without a reader (`folder`) keeps only the manifest and `exif.json`.
 
