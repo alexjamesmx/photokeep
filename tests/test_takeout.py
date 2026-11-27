@@ -4,17 +4,19 @@ import json
 import re
 import shutil
 import zipfile
+from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
 import pytest
 
-from photokeep import importer
+from photokeep import events, importer
 from photokeep.adapters import takeout
 from photokeep.cache import Cache
 from photokeep.events import read_all
 from photokeep.importer import ImportFailed
+from photokeep.library import init_library
 from photokeep.metadata import provider_record
 from photokeep.providers import takeout as provider
 from photokeep.state import fold
@@ -402,3 +404,44 @@ def test_takeout_import(lib, tmp_path, mexico):
     assert provider.read(folder) == {c.source_path: c.provider for c in cands if c.provider}
     again = importer.run(lib, "takeout", cands, sources, False, datetime.now(UTC), roots=e.parts)
     assert (again["imported"], again["already_in_library"], again["problems"]) == (0, 13, [])  # no note again
+
+
+def marks(lib) -> Counter:
+    """Each event other than an import, by what it does to which item."""
+    return Counter((e["op"], e["item"], e.get("album")) for e in read_all(lib)
+                   if e["op"] not in ("import", "copy.name"))
+
+
+@needs_exiftool
+@pytest.mark.parametrize("marks_landed", [0, 1, 2])
+def test_run_whose_log_append_was_cut_off_gets_every_mark_once(lib, tmp_path, monkeypatch, marks_landed):
+    """Power lost mid-append: whole lines up to some point reached the disk. Running the import again writes the
+    marks that are missing, and none twice."""
+    e = export(tmp_path)
+    cands, sources = takeout.list(e.parts)
+
+    def run(into) -> dict:
+        return importer.run(into, "takeout", cands, sources, False, datetime.now(UTC), roots=e.parts)
+
+    clean = init_library(tmp_path / "clean", "clean")
+    run(clean)
+    real = events.append
+
+    def cut_off(into, logged):
+        logged = list(logged)
+        real(into, logged[:sum(x["op"] == "import" for x in logged) + marks_landed])
+        raise OSError("power lost")
+
+    monkeypatch.setattr(events, "append", cut_off)
+    with pytest.raises(OSError, match="power lost"):
+        run(lib)
+    monkeypatch.undo()
+    again = run(lib)
+    assert (again["imported"], again["trashed"] + again["album_links"] + again["favorites"]) == (0, 3 - marks_landed)
+    assert marks(lib) == marks(clean) and set(marks(lib).values()) == {1}
+    state = fold(read_all(lib))
+    assert state.items[sha(e.media[f"{Y}/IMG_0005.jpg"])].status == "trashed"
+    assert state.items[sha(e.media[f"{Y}/IMG_0001.jpg"])].albums == {("album", "Summer trip")}
+    assert state.items[sha(e.media[f"{Y}/IMG_0006.jpg"])].favorite
+    log = read_all(lib)
+    assert run(lib)["trashed"] == 0 and read_all(lib) == log

@@ -57,7 +57,7 @@ class Planned:
     sources: list[Source] = field(default_factory=list)  # the first one creates a new item
     albums: set[str] = field(default_factory=set)
     favorite: bool = False
-    trashed: bool = False  # every copy is in the provider's trash; never for a known item
+    trashed: bool = False  # every copy is in the provider's trash; for a known item, only one this source made
     clip: tuple[Candidate, str] | None = None  # a new item's Live clip and its SHA-256
     version_of: str | None = None
     edit_of: str | None = None
@@ -78,18 +78,24 @@ class Touched:
     favorite: frozenset[str]  # items
     albums: frozenset[tuple[str, str]]  # (item, title)
     renamed: frozenset[str]  # titles an album was renamed from
+    trash: frozenset[str]  # items trashed or restored after they were imported
 
     @classmethod
     def of(cls, log: Iterable[dict]) -> "Touched":
-        favorite, albums, renamed = set(), set(), set()
+        """log: in fold order, which ignores a trash or restore of an item it does not hold yet."""
+        favorite, albums, renamed, trash, imported = set(), set(), set(), set(), set()
         for e in log:
-            if e["op"] in ("favorite", "unfavorite"):
+            if e["op"] == "import":
+                imported.add(e["item"])
+            elif e["op"] in ("trash", "restore") and e["item"] in imported:
+                trash.add(e["item"])
+            elif e["op"] in ("favorite", "unfavorite"):
                 favorite.add(e["item"])
             elif e["op"] in ("album.add", "album.remove") and e["kind"] == "album":
                 albums.add((e["item"], e["album"]))
             elif e["op"] == "album.rename" and e["kind"] == "album":
                 renamed.add(e["album"])
-        return cls(frozenset(favorite), frozenset(albums), frozenset(renamed))
+        return cls(frozenset(favorite), frozenset(albums), frozenset(renamed), frozenset(trash))
 
     def album(self, item: str, title: str) -> bool:
         return (item, title) in self.albums or title in self.renamed
@@ -155,9 +161,9 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
 
     # Decided once per SHA-256: one copy's fingerprint can match a deleted photo while another copy has no date.
     deleted = {shas[p] for p, m in meta.items() if p not in attached and blocked(shas[p], fingerprint(m))}
+    batches = set(import_of.values())  # this source's import ids: earlier runs' and this one's
     items: dict[str, Planned] = {}
     met: set[str] = set()  # SHA-256 of every copy taken so far
-    recorded: set[tuple[str, str]] = set()  # (SHA-256, import id) whose source and marks the log holds already
     first_with: dict[tuple, str] = {}  # fingerprint -> the first item this import adds with it
     alone: list[Candidate] = []  # clips that no item can take: kept as items of their own
     outcome: dict[str, str] = {}
@@ -188,19 +194,18 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
         verdict = ("already_in_library" if known or sha in live_files else "imported") if first \
             else "duplicates_in_source"
         outcome[c.source_path] = verdict
-        key = (sha, import_id)
-        if key in recorded or known and import_id in known.imports or not known and not it and sha in live_files:
-            recorded.add(key)  # this import's record of the bytes is in the log, or there is no item to record
-        else:
+        if known or it or sha not in live_files:  # else the bytes are another item's clip: no item to record
             if it is None:
-                it = items[sha] = Planned(sha, known, trashed=c.trashed and not known)
+                # An item this source made may still be trashed: a run cut off mid-append wrote its import only.
+                it = items[sha] = Planned(sha, known, trashed=c.trashed and (not known or known.imports[0] in batches))
                 if own_clip and not known:
                     problems.append(problem(c, "clip kept as its own item"))
                 if not known:
                     it.version_of = _version_of(state, fp) or (first_with.get(fp) if fp else None)
                     if fp:
                         first_with.setdefault(fp, sha)
-            if key not in {(sha, s.import_id) for s in it.sources}:
+            # A copy whose import the log records already brings only its marks, which events_of filters.
+            if not (known and import_id in known.imports) and import_id not in {s.import_id for s in it.sources}:
                 it.sources.append(Source(c, import_id, folder_of(m["taken"]), list(fp) if fp else None))
             it.albums.update(c.albums)
             it.favorite, it.trashed = it.favorite or c.favorite, it.trashed and c.trashed
@@ -248,10 +253,10 @@ def _notes(items: Collection[Planned], candidates: list[Candidate], problems: li
 def _link_edits(state: State, items: dict[str, Planned], shas: dict[str, str], unread: dict[str, str],
                 problems: list[dict]) -> None:
     """A new item that is an edit links to its original's item, when this import has it or the library holds it."""
-    for it in items.values():
+    for it in (it for it in items.values() if not it.known):
         original = it.main.edit_of
         target = shas.get(original) if original else None
-        if it.known or original is None or original in unread or target == it.sha:
+        if original is None or original in unread or target == it.sha:
             continue  # an unreadable original is listed with its edit's fate
         if target and (target in items or target in state.items and state.items[target].status == "live"):
             it.edit_of = target
@@ -262,7 +267,8 @@ def _link_edits(state: State, items: dict[str, Planned], shas: dict[str, str], u
 def events_of(lib: Library, items: list[Planned], adapter: str, start: datetime, touched: Touched) -> list[dict]:
     """Every import first, then the marks: a trash folded before a later import of the same fingerprint would
     make fold ignore that import. An item the library holds gets only marks the log never set or cleared on it,
-    and never a trash. Each event a microsecond after the last keeps their order."""
+    and a trash only when this source made it and it was never trashed or restored since. Each event a
+    microsecond after the last keeps their order."""
     plain: list[tuple[str, dict]] = []
     for it in items:
         for n, s in enumerate(it.sources):
@@ -278,7 +284,8 @@ def events_of(lib: Library, items: list[Planned], adapter: str, start: datetime,
         plain += [("album.add", {"item": it.sha, "kind": "album", "album": title}) for title in albums]
         if it.favorite and not (it.known and it.sha in touched.favorite):
             plain.append(("favorite", {"item": it.sha}))
-        plain += [("trash", {"item": it.sha, "reason": f"Trashed in {adapter}"})] if it.trashed else []
+        if it.trashed and not (it.known and it.sha in touched.trash):
+            plain.append(("trash", {"item": it.sha, "reason": f"Trashed in {adapter}"}))
     return [events.new_event(lib, op, ts=events.ts_str(start + timedelta(microseconds=k)), **fields)
             for k, (op, fields) in enumerate(plain)]
 

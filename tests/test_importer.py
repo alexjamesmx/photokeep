@@ -127,6 +127,50 @@ def test_bytes_in_the_library_get_this_source_as_another_reference(lib):
     assert read_all(lib) == log
 
 
+def cut_after_imports(monkeypatch) -> None:
+    """The next log append loses power after its import lines reached the disk."""
+    real = events.append
+
+    def cut_off(lib, logged):
+        monkeypatch.setattr(events, "append", real)
+        logged = list(logged)
+        real(lib, [e for e in logged if e["op"] == "import"])
+        raise OSError("power lost")
+
+    monkeypatch.setattr(events, "append", cut_off)
+
+
+@needs_exiftool
+def test_reference_cut_off_before_its_marks_gets_them_but_no_trash(lib, monkeypatch):
+    old = exif_jpeg((1, 2, 3))
+    add_item(lib, old, name="OLD.JPG")
+    again = cand("Trip/OLD.JPG", old, albums=("Trip",), favorite=True, trashed=True)
+    cut_after_imports(monkeypatch)
+    with pytest.raises(OSError, match="power lost"):
+        run(lib, again)
+    assert run(lib, again) == summary(already_in_library=1, album_links=1, favorites=1)
+    item = fold(read_all(lib)).items[sha(old)]
+    assert (item.status, item.favorite, item.albums, len(item.imports)) == ("live", True, {("album", "Trip")}, 2)
+
+
+@needs_exiftool
+@pytest.mark.parametrize("cut_off", [False, True])
+def test_owners_restore_of_an_item_the_source_trashed_is_final(lib, monkeypatch, cut_off):
+    data = exif_jpeg()
+    trashed = cand("a/IMG_1.JPG", data, trashed=True)
+    if cut_off:  # the trash never reached the log; the owner trashed and restored the item meanwhile
+        cut_after_imports(monkeypatch)
+        with pytest.raises(OSError, match="power lost"):
+            run(lib, trashed)
+        events.append(lib, [events.new_event(lib, "trash", item=sha(data))])
+    else:
+        run(lib, trashed)
+    events.append(lib, [events.new_event(lib, "restore", item=sha(data))])
+    log = read_all(lib)
+    assert run(lib, trashed) == summary(already_in_library=1)
+    assert read_all(lib) == log and fold(log).items[sha(data)].status == "live"
+
+
 @needs_exiftool
 def test_metadata_is_kept_when_nothing_is_new(lib):
     photo, clip = exif_jpeg(), b"live clip"
