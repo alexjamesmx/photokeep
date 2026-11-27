@@ -6,6 +6,8 @@ Photokeep is a local-first photo archive for people who want to stop depending o
 
 Phones are planned (as a source of new photos, and as a consumer filled newest-first with a 15% reserve). They are not built; there are no phone commands.
 
+This is the only agent guide. Agents that read `AGENTS.md` natively need nothing else. For one that doesn't, point it here (a setting, or a one-line file saying "Read AGENTS.md") rather than copying text, so the rules live in one place.
+
 ## Invariants
 
 - Never modify an original's bytes. Files in `originals/` and `trash/` are only renamed, copied with hash verification, or deleted when their item is purged.
