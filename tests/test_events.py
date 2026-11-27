@@ -168,3 +168,37 @@ def test_a_write_that_takes_nothing_fails(lib, monkeypatch):
         append(lib, [new_event(lib, "favorite", item="a" * 64)])
     monkeypatch.undo()
     assert [e["op"] for e in read_log(lib.log_path())] == ["copy.name"]
+
+
+
+@pytest.mark.parametrize("fails", ["disk full", "interrupted", "another writer", "fsync"])
+def test_a_failed_append_leaves_the_log_as_it_was(lib, monkeypatch, fails):
+    """Whole lines a failed append left would read as acknowledged: a re-run would take them for done."""
+    before = lib.log_path().read_bytes()
+    real_write, wrote = os.write, []
+
+    def write(fd, data):
+        data = bytes(data)
+        if b'"op":' not in data:
+            return real_write(fd, data)
+        if fails == "another writer":  # a line lands beside the append, so the size check fails
+            real_write(fd, b'{"v":1}\n')
+            return real_write(fd, data)
+        if wrote:
+            if fails == "interrupted":
+                raise KeyboardInterrupt
+            raise OSError(errno.ENOSPC, "No space left on device")
+        wrote.append(data)
+        return real_write(fd, data[:data.index(b"\n") + 1])  # the first line only
+
+    def fsync(fd):
+        raise OSError(errno.EIO, "Input/output error")
+
+    if fails == "fsync":
+        monkeypatch.setattr(os, "fsync", fsync)
+    else:
+        monkeypatch.setattr(os, "write", write)
+    with pytest.raises((OSError, LogCorrupt, KeyboardInterrupt)):
+        append(lib, [new_event(lib, "favorite", item="a" * 64), new_event(lib, "hide", item="a" * 64)])
+    monkeypatch.undo()
+    assert lib.log_path().read_bytes() == before

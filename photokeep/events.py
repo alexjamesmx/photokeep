@@ -77,7 +77,8 @@ def _write_all(fd: int, data: bytes, path: Path) -> None:
 
 
 def append_lines(path: Path, data: bytes, at: int | None = None) -> None:
-    """Append whole lines to a log under its lock, after cutting a torn final line.
+    """Append whole lines to a log under its lock, after cutting a torn final line; an append that fails leaves
+    none of them.
 
     With `at`, the log must then hold exactly `at` bytes: lines copied from another copy's log land
     right after the bytes they were compared against, or not at all.
@@ -92,10 +93,16 @@ def append_lines(path: Path, data: bytes, at: int | None = None) -> None:
         start = os.fstat(fd).st_size
         if at is not None and start != at:
             raise LogCorrupt(f"{path.name} changed while sync was copying it; run sync again")
-        _write_all(fd, data, path)
-        if os.fstat(fd).st_size != start + len(data):
-            raise LogCorrupt(f"{path.name} does not hold the lines just appended; run sync again")
-        os.fsync(fd)
+        try:
+            _write_all(fd, data, path)
+            if os.fstat(fd).st_size != start + len(data):
+                raise LogCorrupt(f"{path.name} does not hold the lines just appended; run sync again")
+            os.fsync(fd)
+        except BaseException:
+            # Lines a failed append left would read as acknowledged: an import run again would take its marks for
+            # written. Under the lock, cutting back to start drops only this append's.
+            os.ftruncate(fd, start)
+            raise
     finally:
         os.close(fd)  # also releases the lock
 
