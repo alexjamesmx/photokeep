@@ -98,7 +98,7 @@ class LayoutPlan:
                 "untracked": len(self.untracked), "conflicts": len(self.conflicts)}
 
 
-def _expected(state: State) -> list[tuple[str, str]]:
+def expected_files(state: State) -> list[tuple[str, str]]:
     out = []
     for item_id, roles in assign(state).items():
         shas = {f["role"]: f["sha256"] for f in state.items[item_id].files}
@@ -117,7 +117,7 @@ def plan_layout(lib: Library, state: State, found: dict[str, list[str]]) -> Layo
     deletes = sorted(p for p, s in at.items() if s in erasable)
     untracked = sorted(p for p, s in at.items() if s not in known)
 
-    expected = _expected(state)
+    expected = expected_files(state)
     placed = {rel for rel, s in expected if at.get(rel) == s}
     spare = {s: [p for p in ps if p not in placed] for s, ps in found.items()}
     todo: list[tuple[str, str, str | None]] = []  # (expected path, sha, source to move)

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photokeep import __version__, sync
+from photokeep import __version__, status, sync, verify
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
 from photokeep.library import LibraryError, init_copy, init_library, open_library
@@ -107,6 +107,71 @@ def cmd_sync(args: argparse.Namespace) -> int:
 
 COMMANDS["sync"] = cmd_sync
 ARGUMENTS["sync"] = _sync_args
+
+
+def _copy_arg(p: argparse.ArgumentParser) -> None:
+    p.add_argument("copy", type=Path, help="a copy of the library")
+
+
+def _verify_args(p: argparse.ArgumentParser) -> None:
+    _copy_arg(p)
+    p.add_argument("--sample", type=int, metavar="N", help="rehash only N random files")
+
+
+def _verify_text(r: verify.VerifyReport) -> str:
+    lines = [f"checked: {r.checked}", f"missing: {_some(r.missing)}", f"corrupt: {_some(r.corrupt)}",
+             f"untracked: {_some(r.untracked)}"]
+    return "\n".join(lines + ["ok" if r.ok else "not ok"])
+
+
+def _report(args: argparse.Namespace, r: verify.VerifyReport) -> int:
+    print(json.dumps(r.to_json()) if args.json else _verify_text(r))
+    return 0 if r.ok else 2
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    """Rehash a copy's files against the log (exit 2 when something is wrong)."""
+    try:
+        return _report(args, verify.verify(open_library(args.copy), sample=args.sample))
+    except (LibraryError, LogCorrupt, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+
+
+def _repair_args(p: argparse.ArgumentParser) -> None:
+    _copy_arg(p)
+    p.add_argument("--from", dest="source", type=Path, required=True, metavar="COPY", help="the copy to restore from")
+
+
+def cmd_repair(args: argparse.Namespace) -> int:
+    """Restore a copy's bad or missing files from another copy (exit 2 when some stay bad)."""
+    try:
+        return _report(args, verify.repair(open_library(args.copy), open_library(args.source)))
+    except (LibraryError, LogCorrupt, CopyError, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """Summarize a copy: items, size and known copies."""
+    try:
+        s = status.status(open_library(args.copy))
+    except (LibraryError, LogCorrupt, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(s))
+    else:
+        names = ", ".join(f"{n} ({c[:8]})" for c, n in s["copies"].items())
+        print(f"copy: {s['copy_name']} ({s['copy_id'][:8]}) of library {s['library_id'][:8]}\n"
+              f"items: {s['items_live']} live, {s['items_trashed']} trashed; {s['bytes_live']} bytes live\n"
+              f"copies: {names}\nlast event: {s['last_event_ts'] or 'none'}")
+    return 0
+
+
+COMMANDS["verify"], ARGUMENTS["verify"] = cmd_verify, _verify_args
+COMMANDS["repair"], ARGUMENTS["repair"] = cmd_repair, _repair_args
+COMMANDS["status"], ARGUMENTS["status"] = cmd_status, _copy_arg
 
 
 def build_parser() -> argparse.ArgumentParser:
