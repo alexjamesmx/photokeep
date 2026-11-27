@@ -45,6 +45,16 @@ The log says what should exist and where. Files are moved to match it, never the
 
 Every step is idempotent, so an interrupted sync is finished by running it again. Without `--yes`, the same code only plans.
 
+## Import
+
+`photokeep import <adapter> <source>... --into <copy>` (in `importer.py`) turns a source into events. An adapter (`adapters/takeout.py`, `adapters/folder.py`) only lists candidate files and the provider files to keep. The shared pipeline then:
+
+1. stages every candidate under `cache/import/`, hashing it and reading its EXIF with exiftool,
+2. plans: skips what the library deleted (trashed, purged, or the same photo re-encoded), records another source for what it already holds, links versions, edits and Live clips (`importplan.py`),
+3. writes `sources/<import-id>/` (provider files verbatim, `exif.json`, `manifest.json`), moves the files into `originals/` and `trash/`, and appends all events in one append, last.
+
+Files go first and the log last, so an interrupted import is finished by running it again. A file that could not be read is left for a later run. `--dry-run` runs steps 1 and 2 and removes its staging.
+
 ## Cache
 
 `cache/index.sqlite` holds one display row per item, derived from the folded log, `sources/` and the files. `cache/files.sqlite` remembers file hashes while size and mtime are unchanged. Thumbnails and previews are rendered by `photokeep cache refresh` and the viewer. A damaged cache is deleted and rebuilt; no data lives only there.

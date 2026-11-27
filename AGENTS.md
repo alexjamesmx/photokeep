@@ -39,6 +39,7 @@ Run as `uv run photokeep ...`, or `python3 -m photokeep ...` with `PYTHONPATH=ap
 - `photokeep cache refresh <copy> [--no-render]` rebuilds the viewer index and renders missing thumbnails. Cache is always rebuildable.
 - `photokeep serve <copy> [--port N] [--no-browser]` runs the viewer until Ctrl+C. It records trash, restore, delete and favorite as events.
 - `photokeep app install <copy>` puts the running Photokeep in the copy's `app/` and refreshes its launchers. Sync then carries it to copies with an older app (see update-app).
+- `photokeep import <takeout|folder> <source>... --into <copy> [--dry-run]` adds photos from Google Takeout (every part: `.zip` files, or extracted folders holding `Takeout/Google Photos/`) or from plain folders. Needs `exiftool`. Progress goes to stderr, the counts to stdout. It skips what the library deleted and what it already holds, and re-running finishes a cut-off import. Exit 2 when `problems` is non-empty (files that need the owner's look). A folder import files photos by their modified date and keeps no provider metadata; use it for plain folders only, with the same dry run and `verify` as in [import-takeout](docs/runbooks/import-takeout.md).
 - `photokeep migrate-v0 <old> <copy> --raw <dir> --zip <file>... [--dry-run]` fills a new copy from the prototype library, once. It copies; the prototype is never changed.
 
 ## Runbooks
@@ -49,6 +50,7 @@ Numbered steps to follow verbatim.
 - [docs/runbooks/add-drive.md](docs/runbooks/add-drive.md): add a drive as a new copy and fill it.
 - [docs/runbooks/verify-repair.md](docs/runbooks/verify-repair.md): check a copy and repair it from another.
 - [docs/runbooks/update-app.md](docs/runbooks/update-app.md): move the newer app to the older copy.
+- [docs/runbooks/import-takeout.md](docs/runbooks/import-takeout.md): import a Google Takeout.
 - [docs/runbooks/migrate-v0.md](docs/runbooks/migrate-v0.md): one-time import of the prototype library.
 
 Design: [docs/architecture.md](docs/architecture.md). Decisions: [docs/decisions/](docs/decisions/0001-folders-and-logs.md).
@@ -76,13 +78,19 @@ Module map (`photokeep/`):
 - `server.py`: local viewer, JSON API, write path to the log.
 - `appcopy.py`: the `app/` copy and launchers in every copy.
 - `locks.py`: advisory file locks.
+- `importer.py`: `run()`, the shared import pipeline; re-exports `Candidate`, `SourceFile`, `ImportFailed`.
+- `importplan.py`: the import decisions and events, with no disk access.
+- `staging.py`: staging under `cache/import/`, exiftool, `ImportFailed`.
+- `sources.py`: `sources/<import-id>/` folders: write, find, read.
+- `progress.py`: rate-limited progress lines.
+- `adapters/`: `takeout.py` and `folder.py`, each `list(sources) -> (candidates, source files)`.
 - `migrate_v0.py`, `zipscan.py`: the one-time prototype migration and zip hashing.
-- `providers/`: readers of provider metadata (`icloud.py`).
+- `providers/`: readers of provider metadata (`icloud.py`, `takeout.py`; the latter also pairs Takeout sidecars).
 - `ui/`: the viewer's HTML, CSS and JS.
 - `launchers/`: `Open Photos` scripts copied to each copy's root.
 
 ## Extending
 
 - **An event op.** Add its required string fields to `_FIELDS` in `events.py`, its fold rule to `State.apply` in `state.py`, a row in the op table of `docs/library-format.md`, and tests. Older readers keep unknown ops and ignore them, so the format stays compatible. If the viewer writes it, add it to `ACTIONS` and `Viewer._change` in `server.py`.
-- **An importer adapter.** Write verbatim provider files to `sources/<import-id>/` with a `manifest.json` (`import`, `adapter`, `exif_root`: the folder exiftool ran on, `files` of `{source_path, sha256, size, mtime, path}` where `path` is the library path at import time, null when the bytes were not imported). List every source file; the first entry of a SHA-256 is the name the item keeps. Put a reader `read(source_dir) -> {source_path: record}` in `providers/<adapter>.py` (see `icloud.py` for the record keys) and register it in `PROVIDERS` in `cache.py`. Write `import` events with the same content hashes, never changing bytes. An importer must skip anything already seen or blocked in the folded state.
+- **An importer adapter.** Add `adapters/<name>.py` with `list(sources: Sequence[Path]) -> (list[Candidate], list[SourceFile])` and register it in `ADAPTERS` in `cli.py`; the name is lower-case letters and digits. A `Candidate` (from `importer`) is one media file: `source_path` (relative, unique, `/`-separated, never `..`), `read` (opens the bytes, streamed), `size`, `mtime` (UTC ISO or None), `name` (the name the item keeps), `provider` (a `metadata.provider_record`, `{}` for none), and optionally `albums`, `trashed`, `favorite`, `live_of` (the photo's source path, for a Live clip), `edit_of` (the original's source path) and `note` (a reason the owner should look, listed in `problems`). A `SourceFile` is a provider file kept verbatim under `sources/<import-id>/`. List every file; never read a whole media file into memory. Call `importer.run(lib, name, candidates, source_files, dry_run, now, progress, roots=<source paths>)`: it hashes, reads EXIF, skips what the library deleted, records other sources of bytes it holds, writes the manifest, files and `import` events, and refuses a source that overlaps the copy. If the provider's files carry display metadata, put a reader `read(source_dir) -> {source_path: record}` in `providers/<name>.py` that builds records with the same code the adapter used, and register it in `PROVIDERS` in `cache.py`. Test with generated files, never real photos.
 - **A UI view.** Add it in `photokeep/ui/` (the page loads `/api/items`; writes are POSTs to the `ACTIONS` routes with the page token). Keep the viewer read-only except through events.

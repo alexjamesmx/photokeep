@@ -8,7 +8,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photokeep import __version__, appcopy, media, migrate_v0, server, status, sync, verify, zipscan
+from photokeep import __version__, appcopy, importer, media, migrate_v0, server, status, sync, verify, zipscan
+from photokeep.adapters import folder, takeout
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
@@ -18,6 +19,8 @@ from photokeep.library import LibraryError, init_copy, init_library, locked, ope
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 # Optional per-command argument definitions, keyed like COMMANDS.
 ARGUMENTS: dict[str, Callable[[argparse.ArgumentParser], None]] = {}
+# Source listers by adapter name: each gives (candidates, provider files to keep) for importer.run.
+ADAPTERS = {"takeout": takeout.list, "folder": folder.list}
 
 
 def _cache_db_error(e: sqlite3.Error) -> int:
@@ -329,6 +332,39 @@ def cmd_migrate_v0(args: argparse.Namespace) -> int:
     return 2 if s["problems"] else 0  # done, but some rows or zip members need the owner's look
 
 
+def _import_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("adapter", choices=sorted(ADAPTERS), help="what the sources are")
+    p.add_argument("sources", type=Path, nargs="+", metavar="source",
+                   help="takeout: every part (a .zip, or a folder holding Takeout/Google Photos); folder: folders")
+    p.add_argument("--into", type=Path, required=True, metavar="COPY", help="the copy to import into")
+    p.add_argument("--dry-run", action="store_true", help="count what would be imported; change nothing")
+
+
+def _import_text(s: dict, dry_run: bool) -> str:
+    lines = [f"{what.replace('_', ' ')}: {n}" for what, n in s.items() if what != "problems"]
+    lines += [f"problems: {len(s['problems'])}", *(f"{p['source_path']}: {p['reason']}" for p in s["problems"])]
+    if dry_run:
+        lines.append("dry run: nothing changed; run again without --dry-run to import")
+    return "\n".join(lines)
+
+
+def cmd_import(args: argparse.Namespace) -> int:
+    """Import a Google Takeout or folders of photos into a copy (shows the counts only, with --dry-run)."""
+    try:
+        lib = open_library(args.into)
+        candidates, kept = ADAPTERS[args.adapter](args.sources)
+        s = importer.run(lib, args.adapter, candidates, kept, args.dry_run, datetime.now(UTC),
+                         lambda line: print(line, file=sys.stderr, flush=True), roots=args.sources)
+    except (importer.ImportFailed, LibraryError, LogCorrupt, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+    except sqlite3.Error as e:
+        return _cache_db_error(e)
+    print(json.dumps(s) if args.json else _import_text(s, args.dry_run))
+    return 2 if s["problems"] else 0  # done, but some files need the owner's look
+
+
+COMMANDS["import"], ARGUMENTS["import"] = cmd_import, _import_args
 COMMANDS["verify"], ARGUMENTS["verify"] = cmd_verify, _verify_args
 COMMANDS["repair"], ARGUMENTS["repair"] = cmd_repair, _repair_args
 COMMANDS["status"], ARGUMENTS["status"] = cmd_status, _copy_arg

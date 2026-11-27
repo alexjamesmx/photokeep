@@ -9,7 +9,7 @@ A library is a set of equal copies. Each copy is a folder; copies converge by ex
   library.json   shared by all copies
   copy.json      this copy only, never synced
   originals/     YYYY/MM/<name>, or undated/<name>
-  sources/       untouched imports (opaque to the app)
+  sources/       one folder per import: provider files verbatim, exif.json, manifest.json
   log/           <copy_id>.jsonl, one change log per copy
   trash/         <item id>/<name>: trashed items, <name> is the name the item has (or would have) in originals/
   cache/         derived data (thumbnails, hashes, files an import is staging); safe to delete
@@ -56,13 +56,23 @@ Common keys: `v` (1), `id` (uuid4 hex), `ts` (UTC, as above), `copy` (author's c
 
 ### Fold rules
 
-- First `import` creates a live item; a later `import` of a live item appends its import id; an `import` of a trashed, purged or blocked item is ignored.
+- First `import` creates a live item; a later `import` of a live item appends its import id (an importer writes one when another source holds the same bytes: its `files` lists only that copy's main file, which fold ignores for a live item); an `import` of a trashed, purged or blocked item is ignored.
 - `trash` makes the item trashed (records `trashed_at`, sets `blocked`). `restore` of a trashed item makes it live and unblocked.
 - `purge` of any item makes it purged and blocked, and is final. For an unknown item it creates a tombstone (`tombstones[id] = name`).
 - `readmit` clears `blocked` on a purged item or tombstone, so a later `import` makes it live again.
 - `favorite`, `hide` and album events apply to any item. `album.rename` renames `(kind, album)` on every item.
 - `copy.name` fills the copy table.
 - An item is blocked if its id, or a fingerprint belonging to a blocked item, matches.
+
+## Import folders
+
+`sources/<import id>/` is one import: the provider's files verbatim (paths as in the source), `exif.json` (exiftool's `-j -n` records of the imported files) and `manifest.json`. The import id is `<YYYY-MM-DD>-<adapter>-<hex>`. The manifest holds:
+
+- `import`, `adapter`, `tool` (the Photokeep version that wrote it).
+- `exif_root`: the folder exiftool ran on; every `SourceFile` in `exif.json` is `<exif_root>/<source_path>`.
+- `files`: one `{source_path, sha256, size, mtime, path}` per media file the import settled. `path` is the library path of those bytes when the import wrote them or the library already held them, null when the library had deleted them. A file that could not be read is not listed; a later run imports it under a new import id. `mtime` is null when the source has no real date (a Takeout zip).
+
+A provider reader (`providers/<adapter>.py`) turns these files into display metadata. An import without a reader (`folder`) keeps only the manifest and `exif.json`.
 
 ## Trash
 

@@ -15,6 +15,7 @@ uv run photokeep init /path/to/drive/Photos --name drive --copy-of ~/Photos
 uv run photokeep sync ~/Photos /path/to/drive/Photos          # shows the plan
 uv run photokeep sync ~/Photos /path/to/drive/Photos --yes    # carries it out
 uv run photokeep serve ~/Photos                                # opens the viewer
+uv run photokeep import takeout takeout-*.zip --into ~/Photos --dry-run   # Google Takeout; needs exiftool
 ```
 
 Every copy also carries its own `app/` and an `Open Photos` launcher, so a drive opens on any computer with Python.
