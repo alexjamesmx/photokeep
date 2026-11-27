@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 import re
@@ -64,6 +65,16 @@ def encode(events: Iterable[dict]) -> bytes:
     return "".join(json.dumps(e, ensure_ascii=False, separators=(",", ":")) + "\n" for e in events).encode()
 
 
+def _write_all(fd: int, data: bytes, path: Path) -> None:
+    # A write may take only part of the bytes (a disk filling up); the rest follows, or the append fails.
+    rest = memoryview(data)
+    while rest:
+        n = os.write(fd, rest)
+        if n == 0:
+            raise OSError(errno.EIO, f"{path.name}: the disk took no bytes of the append")
+        rest = rest[n:]
+
+
 def append_lines(path: Path, data: bytes, at: int | None = None) -> None:
     """Append whole lines to a log under its lock, after cutting a torn final line.
 
@@ -77,9 +88,12 @@ def append_lines(path: Path, data: bytes, at: int | None = None) -> None:
     try:
         locks.flock(fd)
         _drop_torn_tail(fd)
-        if at is not None and os.fstat(fd).st_size != at:
+        start = os.fstat(fd).st_size
+        if at is not None and start != at:
             raise LogCorrupt(f"{path.name} changed while sync was copying it; run sync again")
-        os.write(fd, data)
+        _write_all(fd, data, path)
+        if os.fstat(fd).st_size != start + len(data):
+            raise LogCorrupt(f"{path.name} does not hold the lines just appended; run sync again")
         os.fsync(fd)
     finally:
         os.close(fd)  # also releases the lock

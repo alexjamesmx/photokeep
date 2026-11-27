@@ -538,3 +538,28 @@ def test_source_with_wrong_bytes_goes_to_bad_sources(a, b, monkeypatch):
     s = run(a, b, NOW).summary()
     assert s["bad_sources"] == [{"side": "a", "path": f"sources/{IMPORT}/exif.json", "sha": sha(b"[]")}]
     assert sources_of(b) == {}
+
+
+def test_restore_cut_short_by_a_full_disk_is_never_purged(a, b, monkeypatch):
+    x = add_item(a, b"precious", name="A.JPG")
+    mark(a, "trash", x)
+    run(a, b, TRASHED + timedelta(days=1))
+    mark(b, "restore", x, ts=ts_str(TRASHED + timedelta(days=5)))
+    real = os.write
+    # the drive's restore line reaches the laptop only half at a time
+    monkeypatch.setattr(os, "write", lambda fd, data: real(fd, bytes(data)[:len(data) // 2 or 1])
+                        if b'"restore"' in bytes(data) else real(fd, data))
+    s = run(a, b, TRASHED + timedelta(days=31)).summary()
+    monkeypatch.undo()
+    assert s["new_purges"] == [] and logs_of(a) == logs_of(b)
+    assert files_of(a) == files_of(b) == {"originals/2024/01/A.JPG": b"precious"}
+
+
+def test_logs_left_unequal_by_the_exchange_stop_the_sync(a, b, monkeypatch):
+    x = add_item(a, b"precious", name="A.JPG")
+    mark(a, "trash", x)
+    monkeypatch.setattr(events, "append_lines", lambda *args, **kwargs: None)  # a write that was lost
+    before = snapshot(a, b)
+    with pytest.raises(LogCorrupt, match="still differ"):
+        run(a, b, TRASHED + timedelta(days=31))
+    assert snapshot(a, b) == before

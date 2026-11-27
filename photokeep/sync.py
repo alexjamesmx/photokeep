@@ -142,12 +142,15 @@ def exchange_logs(a: Library, b: Library, dry_run: bool) -> list[tuple[str, str,
     """Append to each copy the log lines only the other has; return (file, direction, bytes) per log copied.
 
     Every log is compared and every line to copy is validated before the first write, so a diverged
-    or corrupt log changes nothing on either copy.
+    or corrupt log changes nothing on either copy. After the writes both copies must hold the same lines:
+    purges and file deletes are worked out from one side's logs alone.
     """
     todo = _appends(a, b, _compare(a, b))
     if not dry_run:
         for t in todo:
             events.append_lines(t.dst.log_dir / t.name, t.tail, at=t.at)
+        if any(log.on_a != log.on_b for log in _compare(a, b)):
+            raise LogCorrupt(f"the logs of {a.root} and {b.root} still differ after copying them; run sync again")
     return [t.report() for t in todo]
 
 

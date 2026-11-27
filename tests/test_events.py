@@ -130,3 +130,28 @@ def test_known_op_without_its_fields_is_corrupt(fields):
     line = json.dumps({"v": 1, "id": "x", "ts": "t", "copy": "c"} | fields).encode() + b"\n"
     with pytest.raises(LogCorrupt, match=rf"c\.jsonl: line 1 is not a valid {re.escape(fields['op'])} event"):
         parse_log(line, "c.jsonl")
+
+
+def _short_writes(monkeypatch, most: int) -> None:
+    """os.write takes at most `most` bytes of a log line per call, as a filling disk may."""
+    real = os.write
+
+    def write(fd, data):
+        return real(fd, bytes(data)[:most]) if b'"op":' in bytes(data) else real(fd, data)
+
+    monkeypatch.setattr(os, "write", write)
+
+
+def test_a_short_write_is_finished(lib, monkeypatch):
+    _short_writes(monkeypatch, most=7)
+    append(lib, [new_event(lib, "favorite", item="a" * 64), new_event(lib, "hide", item="a" * 64)])
+    monkeypatch.undo()
+    assert [e["op"] for e in read_log(lib.log_path())] == ["copy.name", "favorite", "hide"]
+
+
+def test_a_write_that_takes_nothing_fails(lib, monkeypatch):
+    _short_writes(monkeypatch, most=0)
+    with pytest.raises(OSError, match="no bytes"):
+        append(lib, [new_event(lib, "favorite", item="a" * 64)])
+    monkeypatch.undo()
+    assert [e["op"] for e in read_log(lib.log_path())] == ["copy.name"]
