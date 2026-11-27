@@ -7,7 +7,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photokeep import __version__, appcopy, media, migrate_v0, server, status, sync, verify
+from photokeep import __version__, appcopy, media, migrate_v0, server, status, sync, verify, zipscan
 from photokeep.cache import Cache
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
@@ -275,7 +275,7 @@ def cmd_migrate_v0(args: argparse.Namespace) -> int:
     try:
         s = migrate_v0.migrate(args.old, args.raw, args.zips, open_library(args.copy), args.dry_run,
                                progress=lambda line: print(line, file=sys.stderr, flush=True))
-    except (LibraryError, LogCorrupt, CopyError, OSError, migrate_v0.MigrationError) as e:
+    except (LibraryError, LogCorrupt, CopyError, OSError, migrate_v0.MigrationError, zipscan.ZipScanError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
     except sqlite3.Error as e:

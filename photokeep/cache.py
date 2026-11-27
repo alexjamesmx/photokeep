@@ -74,7 +74,7 @@ def _json(path: Path, missing):
         return None
 
 
-def _exif_key(source_file: str, import_id: str) -> str:
+def exif_key(source_file: str, import_id: str) -> str:
     """exiftool's SourceFile as a manifest source_path: without the folder exiftool ran in (raw/ or the import's)."""
     parts = PurePosixPath(source_file).parts
     cut = next((i + 1 for i, part in enumerate(parts[:-1]) if part in ("raw", import_id)), 0)
@@ -106,7 +106,7 @@ def _import_sources(folder: Path) -> _Read:
     records = _json(folder / "exif.json", [])
     provider = _provider(folder, _adapter(manifest, folder.name))
     errors = int(not isinstance(records, list)) + int(provider is None)
-    exif = {_exif_key(str(r.get("SourceFile", "")), folder.name): r
+    exif = {exif_key(str(r.get("SourceFile", "")), folder.name): r
             for r in (records if isinstance(records, list) else []) if isinstance(r, dict)}
     provider = provider or {}
     files = {f["sha256"]: _Source(f["source_path"], _str(f.get("mtime")), exif.get(f["source_path"], {}),

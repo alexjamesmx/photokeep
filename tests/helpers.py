@@ -105,6 +105,11 @@ def render_or_die(item_id: str, path: Path, *args) -> dict:
     return _real_render(item_id, path, *args)
 
 
+def exit_worker(*_) -> None:
+    """A worker task that dies the way an out-of-memory kill would."""
+    os._exit(1)
+
+
 def mark(lib: Library, op: str, item: str, ts: str = T1) -> None:
     events.append(lib, [ev(op, item, ts=ts, copy=lib.copy_id)])
 
@@ -196,12 +201,14 @@ class V0:
         return self.root / ".library/library.db"
 
     def add(self, data: bytes | None, path: str, orig: str, *, clip: bytes | None = None, **cols) -> int:
-        """A row and, unless data is None, its file at path (and clip at cols["live"]); other columns default."""
+        """A row and, unless data is None, its file at path (and clip at cols["live"], its size in live_size);
+        other columns default."""
         for rel, content in ((path, data), (cols.get("live"), clip)):
             if rel and content is not None:
                 _write(self.root / rel, content)
         row = {"path": path, "home": path, "kind": "photo", "ext": Path(path).suffix.lower(),
-               "size": len(data or b""), "orig": orig, "sha256": sha(data or b""), **cols}
+               "size": len(data or b""), "live_size": len(clip or b""), "orig": orig, "sha256": sha(data or b""),
+               **cols}
         row |= {c: json.dumps(row[c]) for c in ("albums", "memories") if c in row}
         with closing(sqlite3.connect(self.db)) as db, db:
             return db.execute(f"INSERT INTO items ({', '.join(row)}) VALUES ({', '.join('?' * len(row))})",
@@ -226,7 +233,7 @@ def make_v0(tmp_path: Path) -> V0:
         db.executescript(V0_SCHEMA)
     ida = v.add(a, "2024/2024-03/2024-03-05 10.00.00.jpg", "part1/IMG_0001.JPG", clip=clip,
                 live="2024/2024-03/2024-03-05 10.00.00.mov", live_home="2024/2024-03/2024-03-05 10.00.00.mov",
-                live_size=len(clip), taken="2024-03-05T10:00:00", favorite=1, albums=["Trip"], memories=["Summer"],
+                taken="2024-03-05T10:00:00", favorite=1, albums=["Trip"], memories=["Summer"],
                 w=8, h=8, sharp=12.5, bright=100.0, noise=1.5, dhash="00ff00ff00ff00ff", thumb=1, preview=1)
     idb = v.add(b, ".library/trash/2.jpg", "part1/IMG_0002.JPG", home="2024/2024-03/2024-03-06 09.00.00.jpg",
                 taken="2024-03-06T09:00:00", trashed=1, trashed_at=trashed_at, reason="Deleted in Photos", thumb=1)

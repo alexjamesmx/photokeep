@@ -1,17 +1,19 @@
 import json
 import re
+import zipfile
 from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from photokeep import events, fsops
+from photokeep import events, fsops, zipscan
 from photokeep.cache import Cache
 from photokeep.cli import main
 from photokeep.events import read_all, ts_str
+from photokeep.library import init_library
 from photokeep.migrate_v0 import MigrationError, migrate
 from photokeep.state import fold
 from photokeep.verify import verify
-from tests.helpers import add_item, fail_after, jpeg_bytes, make_v0, snapshot, tree
+from tests.helpers import add_item, exit_worker, fail_after, jpeg_bytes, make_v0, sha, snapshot, tree
 
 IMPORT_ID = re.compile(r"\d{4}-\d\d-\d\d-icloud-[0-9a-f]{6}")
 
@@ -150,8 +152,23 @@ def test_run_cut_off_before_the_log_reuses_its_sources(tmp_path, lib, monkeypatc
 def test_refuses_a_copy_that_has_items(tmp_path, lib):
     v = make_v0(tmp_path)
     add_item(lib, b"photo")
-    with pytest.raises(MigrationError, match="already has items"):
+    with pytest.raises(MigrationError, match="already has items") as refused:
         run(v, lib)
+    assert f"photokeep cache refresh {lib.root}" in str(refused.value)
+    assert f"photokeep verify {lib.root}" in str(refused.value)
+
+
+@pytest.mark.parametrize("where", ["copy in prototype", "copy in raw", "prototype in copy"])
+def test_refuses_a_copy_overlapping_the_prototype(tmp_path, where):
+    if where == "prototype in copy":
+        lib = init_library(tmp_path / "D", "laptop")
+        v = make_v0(lib.root)
+    else:
+        v = make_v0(tmp_path)
+        lib = init_library((v.root if where == "copy in prototype" else v.raw) / "copy", "laptop")
+    with pytest.raises(MigrationError, match="overlap"):
+        run(v, lib)
+    assert fold(read_all(lib)).items == {}
 
 
 def test_duplicates_merge_and_bad_rows_are_skipped(tmp_path, lib):
@@ -167,6 +184,89 @@ def test_duplicates_merge_and_bad_rows_are_skipped(tmp_path, lib):
     assert (item.favorite, item.hidden) == (True, True)
     assert item.albums == {("album", "Trip"), ("album", "Other"), ("memory", "Winter")}
     assert verify(lib).ok
+
+
+def test_duplicate_with_a_clip_is_the_one_kept(tmp_path, lib):
+    v = make_v0(tmp_path)
+    c = (v.root / "Undated/IMG_0003.JPG").read_bytes()  # C has no clip
+    kept = v.add(c, "Undated/IMG_0004.JPG", "part2/IMG_0004.JPG", clip=b"clip 4", live="Undated/IMG_0004.mov")
+    other = v.add(c, "Undated/IMG_0005.JPG", "part2/IMG_0005.JPG", clip=b"clip 5", live="Undated/IMG_0005.mov")
+    summary = run(v, lib)
+    item = fold(read_all(lib)).items[v.shas["c"]]
+    assert {f["role"]: f["name"] for f in item.files} == {"main": "IMG_0004.JPG", "live": "IMG_0004.MOV"}
+    assert (lib.originals / "undated/IMG_0004.MOV").read_bytes() == b"clip 4"
+    assert {"source": f"row {other} (Undated/IMG_0005.JPG)",
+            "problem": f"live clip Undated/IMG_0005.mov not migrated (duplicate of row {kept})"} in summary["problems"]
+    assert (summary["items"], summary["live_clips"]) == (3, 2) and verify(lib).ok
+
+
+def test_first_duplicate_in_the_trash_is_not_the_one_kept(tmp_path, lib):
+    v = make_v0(tmp_path)
+    data = jpeg_bytes((7, 7, 7))
+    v.add(data, ".library/trash/10.jpg", "part1/IMG_0010.JPG", taken="2023-01-01T00:00:00", trashed=1,
+          trashed_at=v.trashed_at, reason="Exact duplicate of part1/IMG_0011.JPG")
+    v.add(data, "2023/2023-02/2023-02-01 00.00.00.jpg", "part1/IMG_0011.JPG", taken="2023-02-01T00:00:00")
+    run(v, lib)
+    item = fold(read_all(lib)).items[sha(data)]
+    assert (item.status, item.folder, item.files[0]["name"]) == ("live", "2023/02", "IMG_0011.JPG")
+    assert (lib.originals / "2023/02/IMG_0011.JPG").read_bytes() == data
+
+
+def test_trashed_item_keeps_its_marks(tmp_path, lib):
+    v = make_v0(tmp_path)
+    data = jpeg_bytes((8, 8, 8))
+    v.add(data, ".library/trash/20.jpg", "part1/IMG_0020.JPG", trashed=1, trashed_at=v.trashed_at,
+          favorite=1, albums=["Trip"], memories=["Summer"])
+    run(v, lib)
+    item = fold(read_all(lib)).items[sha(data)]
+    assert (item.status, item.favorite) == ("trashed", True)
+    assert item.albums == {("album", "Trip"), ("memory", "Summer")}
+    assert (lib.trash / item.id / "IMG_0020.JPG").read_bytes() == data
+
+
+def test_clip_of_the_wrong_size_skips_its_row(tmp_path, lib):
+    v = make_v0(tmp_path)
+    row = v.add(jpeg_bytes((6, 6, 6)), "2024/2024-04/b.jpg", "part2/IMG_0008.JPG", clip=b"clip 8",
+                live="2024/2024-04/b.mov", live_size=999)
+    summary = run(v, lib)
+    assert summary["problems"] == [{"source": f"row {row} (2024/2024-04/b.jpg)",
+                                    "problem": "live clip is 6 bytes, the database says 999"}]
+    assert summary["items"] == 3
+
+
+def test_damaged_zip_member_is_a_problem_not_a_tombstone(tmp_path, lib):
+    v = make_v0(tmp_path)
+    bad, body = tmp_path / "bad.zip", b"photo bytes " * 50
+    with zipfile.ZipFile(bad, "w", zipfile.ZIP_STORED) as zf:
+        zf.writestr("Part/Photos/IMG_0100.JPG", body)
+    bad.write_bytes(bad.read_bytes().replace(body, b"X" + body[1:]))  # same length: only the CRC check fails
+    summary = migrate(v.root, v.raw, [v.zip, bad], lib, False)
+    assert summary["problems"] == [{"source": "bad.zip:Part/Photos/IMG_0100.JPG", "problem": "unreadable zip member"}]
+    assert set(fold(read_all(lib)).tombstones) == {v.shas["extra"]}
+
+
+def _bad_exif(v, monkeypatch):
+    (v.raw.parent / "exif.json").write_text("{not json")
+
+
+def _bad_albums(v, monkeypatch):
+    v.add(jpeg_bytes((4, 4, 4)), "Undated/IMG_0009.JPG", "part2/IMG_0009.JPG", albums="Trip")
+
+
+def _dying_worker(v, monkeypatch):
+    monkeypatch.setattr(zipscan, "_sha", exit_worker)
+
+
+@pytest.mark.parametrize("spoil", [_bad_exif, _bad_albums, _dying_worker])
+def test_bad_input_is_a_one_line_error_before_any_write(tmp_path, lib, capsys, monkeypatch, spoil):
+    v = make_v0(tmp_path)
+    spoil(v, monkeypatch)
+    before = snapshot(lib)
+    code = main(["migrate-v0", str(v.root), str(lib.root), "--raw", str(v.raw), "--zip", str(v.zip)])
+    out, err = capsys.readouterr()
+    errors = [line for line in err.splitlines() if not line.startswith("hashing")]
+    assert (code, out) == (1, "") and len(errors) == 1 and errors[0].startswith("photokeep: ")
+    assert snapshot(lib) == before
 
 
 def test_clip_without_identifier_is_named_after_its_photo(tmp_path, lib):
