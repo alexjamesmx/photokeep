@@ -136,14 +136,30 @@ def _verify_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--sample", type=int, metavar="N", help="rehash only N random files")
 
 
+def _verify_lines(r: verify.VerifyReport) -> list[str]:
+    return [f"checked: {r.checked}", f"missing: {_some(r.missing)}", f"corrupt: {_some(r.corrupt)}",
+            f"untracked: {_some(r.untracked)}"]
+
+
 def _verify_text(r: verify.VerifyReport) -> str:
-    lines = [f"checked: {r.checked}", f"missing: {_some(r.missing)}", f"corrupt: {_some(r.corrupt)}",
-             f"untracked: {_some(r.untracked)}"]
-    return "\n".join(lines + ["ok" if r.ok else "not ok"])
+    return "\n".join(_verify_lines(r) + ["ok" if r.ok else "not ok"])
 
 
-def _report(args: argparse.Namespace, r: verify.VerifyReport) -> int:
-    print(json.dumps(r.to_json()) if args.json else _verify_text(r))
+def _repair_text(r: verify.RepairReport) -> str:
+    lines = [f"{'to restore' if r.dry_run else 'restored'}: {_some(r.restore)}",
+             f"no good copy in the other copy: {_some(r.no_source)}",
+             f"failed: {_some([f'{path}: {reason}' for path, reason in r.failed])}"]
+    if r.quarantine:
+        lines.append(f"corrupt files kept in: {r.quarantine}")
+    lines += _verify_lines(r.after) + ["ok" if r.ok else "not ok"]
+    if r.dry_run:
+        lines.append("dry run: nothing changed; run again without --dry-run to repair")
+    return "\n".join(lines)
+
+
+def _report(args: argparse.Namespace, r: verify.VerifyReport | verify.RepairReport) -> int:
+    text = _verify_text(r) if isinstance(r, verify.VerifyReport) else _repair_text(r)
+    print(json.dumps(r.to_json()) if args.json else text)
     return 0 if r.ok else 2
 
 
@@ -161,12 +177,13 @@ def cmd_verify(args: argparse.Namespace) -> int:
 def _repair_args(p: argparse.ArgumentParser) -> None:
     _copy_arg(p)
     p.add_argument("--from", dest="source", type=Path, required=True, metavar="COPY", help="the copy to restore from")
+    p.add_argument("--dry-run", action="store_true", help="show what would be restored; change nothing")
 
 
 def cmd_repair(args: argparse.Namespace) -> int:
     """Restore a copy's bad or missing files from another copy (exit 2 when some stay bad)."""
     try:
-        return _report(args, verify.repair(open_library(args.copy), open_library(args.source)))
+        return _report(args, verify.repair(open_library(args.copy), open_library(args.source), args.dry_run))
     except (LibraryError, LogCorrupt, CopyError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1

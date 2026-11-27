@@ -13,6 +13,7 @@ A library is a set of equal copies. Each copy is a folder; copies converge by ex
   log/           <copy_id>.jsonl, one change log per copy
   trash/         <item id>/<name>: trashed items, <name> is the name the item has (or would have) in originals/
   cache/         derived data (thumbnails, hashes); safe to delete
+  quarantine/    <run>/<path>: corrupt files `repair` replaced, kept for the owner; never synced, scanned or deleted
   app/           photokeep/: a copy of the app, so the copy opens on any computer with Python 3.11+
   Open Photos.sh, Open Photos.command, Open Photos.bat   start the viewer from app/ (Linux, macOS, Windows)
 ```

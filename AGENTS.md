@@ -32,7 +32,7 @@ Run as `uv run photokeep ...`, or `python3 -m photokeep ...` with `PYTHONPATH=ap
 - `photokeep sync <a> <b> [--yes] [--update-app]` syncs two copies both ways. Without `--yes` it only prints the plan, which is the dry run. Exit 2 when copies could not be made whole.
 - `photokeep status <copy>` shows items, size, known copies and the last event.
 - `photokeep verify <copy> [--sample N]` rehashes a copy's files against the log. Exit 2 when something is missing, corrupt or untracked.
-- `photokeep repair <copy> --from <copy>` quarantines corrupt files and restores missing and corrupt ones from another copy. Exit 2 when some stay bad. No dry run.
+- `photokeep repair <copy> --from <copy> [--dry-run]` restores missing and corrupt files from another copy's verified bytes. A corrupt file moves to `quarantine/` only once its replacement is ready. Exit 2 when some stay bad.
 - `photokeep cache refresh <copy> [--no-render]` rebuilds the viewer index and renders missing thumbnails. Cache is always rebuildable.
 - `photokeep serve <copy> [--port N] [--no-browser]` runs the viewer until Ctrl+C. It records trash, restore, delete and favorite as events.
 - `photokeep migrate-v0 <old> <copy> --raw <dir> --zip <file>... [--dry-run]` fills a new copy from the prototype library, once. It copies; the prototype is never changed.

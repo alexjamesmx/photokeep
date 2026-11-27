@@ -16,12 +16,17 @@ Use for a periodic check, after a drive error, or when a copy looks wrong.
    photokeep verify <good-copy> --json
    ```
    Success: `"ok": true`.
-4. After the owner agrees:
+4. Show the owner what repair would do (this changes nothing):
+   ```
+   photokeep repair <copy> --from <good-copy> --dry-run --json
+   ```
+   `restore` lists the files the good copy holds right bytes for; `no_source` lists the files it does not. Exit 2 means the copy would not be whole afterwards: some files have no good copy, or untracked files remain.
+5. After the owner agrees:
    ```
    photokeep repair <copy> --from <good-copy> --json
    ```
-   Corrupt files are moved to `cache/quarantine/<stamp>/` first and kept there, never deleted. Success: exit 0 and `"ok": true` in the fresh report it prints.
-5. If exit 2 after repair, the listed files are bad in the source too. Look for a third copy and repeat step 4 with it. If there is none, report the files to the owner.
-6. Quarantined files are the owner's to delete. Do not remove `cache/quarantine/` yourself.
+   Each replacement is copied and checked before the corrupt file moves, and the corrupt file is kept in `quarantine/<run>/` at the copy's root (`quarantine` in the output), never deleted. A corrupt file with no good copy in `<good-copy>` stays where it is. Success: exit 0 and `"ok": true`.
+6. If exit 2 after repair, read `no_source` and `failed`: those files are bad or missing in the source too, or could not be written. Look for a third copy and repeat steps 4 and 5 with it. If there is none, report the files to the owner.
+7. Quarantined files are the owner's to delete. Do not remove `quarantine/` yourself.
 
 If the index looks wrong, `photokeep cache refresh <copy>` rebuilds it; `cache/` holds only rebuildable data.

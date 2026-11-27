@@ -41,9 +41,8 @@ def _refuse_existing(dst: Path) -> None:
         raise CopyError(f"{dst} already exists")
 
 
-def copy_verified(src: Path, dst: Path, sha: str) -> None:
-    """Copy src to dst through dst.part; dst appears only once the bytes match sha."""
-    _refuse_existing(dst)
+def stage_verified(src: Path, dst: Path, sha: str) -> Path:
+    """Copy src to the temp file beside dst and check its bytes; the caller renames it into place."""
     dst.parent.mkdir(parents=True, exist_ok=True)
     part = dst.with_name(dst.name + PART)
     part.unlink(missing_ok=True)  # left by an interrupted run; safe_name keeps originals off this name
@@ -58,6 +57,17 @@ def copy_verified(src: Path, dst: Path, sha: str) -> None:
             os.fsync(fout.fileno())
         if digest.hexdigest() != sha:
             raise HashMismatch(f"{src}: SHA-256 is {digest.hexdigest()}, expected {sha}")
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+    return part
+
+
+def copy_verified(src: Path, dst: Path, sha: str) -> None:
+    """Copy src to dst through a temp file beside it; dst appears only once the bytes match sha."""
+    _refuse_existing(dst)
+    part = stage_verified(src, dst, sha)
+    try:
         _refuse_existing(dst)  # a long copy leaves time for something else to create dst
         os.replace(part, dst)
     finally:

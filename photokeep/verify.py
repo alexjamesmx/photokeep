@@ -1,8 +1,12 @@
 """Check a copy's files against the folded state, and repair them from another copy."""
 import os
 import random
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 
 from photokeep import fsops
 from photokeep.events import read_all
@@ -59,36 +63,93 @@ def verify(lib: Library, sample: int | None = None, rng: random.Random | None = 
     return VerifyReport(len(present), sorted(missing), corrupt, untracked)
 
 
-def _quarantine(lib: Library, rels: list[str]) -> None:
-    stamp = datetime.now(UTC).strftime(_STAMP)
-    with HashCache(lib) as cache:
-        for rel in rels:
-            target = lib.cache_dir() / "quarantine" / stamp / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(lib.root / rel, target)
-            cache.forget(lib.root / rel)
+@dataclass
+class RepairReport:
+    restore: list[str]  # bad files the other copy holds good bytes for: restored, or with dry_run to restore
+    no_source: list[str]  # bad files the other copy holds no good bytes for: left as they are
+    failed: fsops.Failed  # could not be restored this run; a corrupt one stays in place
+    quarantine: str | None  # this run's folder of replaced corrupt files, relative to the root
+    after: VerifyReport  # verify after the repair; with dry_run, the one the plan was made from
+    dry_run: bool
+
+    @property
+    def ok(self) -> bool:
+        """The copy is whole after the repair; with dry_run, it would be, as far as the other copy's cache knows."""
+        return not (self.no_source or self.after.untracked) if self.dry_run else self.after.ok
+
+    def to_json(self) -> dict:
+        return self.after.to_json() | {
+            "ok": self.ok, "dry_run": self.dry_run, "restore": self.restore, "no_source": self.no_source,
+            "failed": [{"path": path, "reason": reason} for path, reason in self.failed], "quarantine": self.quarantine}
 
 
-def repair(lib: Library, other: Library) -> VerifyReport:
-    """Quarantine corrupt files, then restore missing and corrupt ones from `other`; return a fresh verify."""
+def _run_folder(lib: Library) -> Path:
+    """A new folder under quarantine/ for this run: outside cache/, which is safe to delete."""
+    if lib.quarantine.is_symlink():  # moving corrupt files through it would send them elsewhere
+        raise LibraryError(f"{lib.quarantine} is a symlink; quarantine/ must be a real folder")
+    lib.quarantine.mkdir(exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix=datetime.now(UTC).strftime(_STAMP) + "-", dir=lib.quarantine))
+
+
+class _Restorer:
+    """Puts good bytes from another copy in place of a copy's missing and corrupt files."""
+
+    def __init__(self, lib: Library, other: Library, held: dict[str, list[str]]):
+        self.lib, self.other, self.held = lib, other, held
+        self.quarantine: Path | None = None  # made when the first corrupt file is moved aside
+
+    def restore(self, rel: str, sha: str, corrupt: bool) -> None:
+        target, source = self.lib.root / rel, self.other.root / self.held[sha][0]
+        if not inside(self.lib, target):
+            raise fsops.CopyError(f"{rel} leads outside originals/ and trash/")
+        if not corrupt:
+            return fsops.copy_verified(source, target, sha)
+        # The replacement is staged and checked first: when the other copy's bytes turn out bad too,
+        # the corrupt file is never moved, and the copy keeps the only bytes it has.
+        part = fsops.stage_verified(source, target, sha)
+        try:
+            self.quarantine = self.quarantine or _run_folder(self.lib)
+            aside = self.quarantine / rel
+            aside.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(target, aside)
+            os.replace(part, target)
+        finally:
+            part.unlink(missing_ok=True)
+
+
+@contextmanager
+def _both_locked(lib: Library, other: Library) -> Iterator[None]:
+    with locked(lib), locked(other):
+        yield
+
+
+def repair(lib: Library, other: Library, dry_run: bool = False) -> RepairReport:
+    """Restore lib's missing and corrupt files from good copies in other; with dry_run, only plan it.
+
+    A corrupt file is replaced only by verified bytes and is kept under quarantine/; with no good
+    copy in other it stays where it is.
+    """
     if lib.library_id != other.library_id:
         raise LibraryError(f"{lib.root} and {other.root} are copies of different libraries")
     if lib.copy_id == other.copy_id:
         raise LibraryError(f"{lib.root} and {other.root} are the same copy")
-    with locked(lib), locked(other):
+    with nullcontext() if dry_run else _both_locked(lib, other):
         report = verify(lib)
-        _quarantine(lib, report.corrupt)
-        want = {rel: s for rel, s in expected_files(fold(read_all(lib)))}
+        want = dict(expected_files(fold(read_all(lib))))  # path -> sha
         held = scan(other, cleanup=False)
+        bad = sorted(report.missing + report.corrupt)
+        todo, no_source = [rel for rel in bad if want[rel] in held], [rel for rel in bad if want[rel] not in held]
+        if dry_run:
+            return RepairReport(todo, no_source, [], None, report, dry_run=True)
+        restorer, done, failed = _Restorer(lib, other, held), [], []
         with HashCache(lib) as cache:
-            for rel in report.missing + report.corrupt:
-                sources = held.get(want[rel])
-                target = lib.root / rel
-                if not sources or not inside(lib, target):
-                    continue
+            for rel in todo:
                 try:
-                    fsops.copy_verified(other.root / sources[0], target, want[rel])
-                except fsops.HashMismatch:  # the other copy's file is rotten too
-                    continue
-                cache.record(target, want[rel])
-        return verify(lib)
+                    restorer.restore(rel, want[rel], corrupt=rel in report.corrupt)
+                except (fsops.CopyError, OSError) as e:  # a HashMismatch too: the other copy's file is rotten
+                    failed.append((rel, fsops.failure(e)))
+                else:
+                    cache.record(lib.root / rel, want[rel])
+                    done.append(rel)
+        folder = restorer.quarantine.relative_to(lib.root).as_posix() if restorer.quarantine else None
+        return RepairReport(done, no_source, failed, folder, verify(lib), dry_run=False)

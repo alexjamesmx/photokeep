@@ -54,6 +54,11 @@ class Library:
     def app(self) -> Path:
         return self.root / "app"
 
+    @property
+    def quarantine(self) -> Path:
+        """Corrupt files repair replaced, one folder per run; created by repair, never synced or scanned."""
+        return self.root / "quarantine"
+
     def log_path(self, copy_id: str | None = None) -> Path:
         return self.log_dir / f"{copy_id or self.copy_id}.jsonl"
 
