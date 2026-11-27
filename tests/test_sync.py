@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from photokeep import events, fsops, hashcache
+from photokeep.cache import Cache
 from photokeep.cli import main
 from photokeep.events import LogCorrupt, append_lines, read_all, read_log, ts_str
 from photokeep.fsops import CopyError
@@ -46,6 +47,14 @@ def test_new_items_flow_both_ways(a, b):
     assert files_of(a) == files_of(b) == {"originals/2024/01/A.JPG": b"from a", "originals/2024/02/B.JPG": b"from b"}
     assert logs_of(a) == logs_of(b)
     assert {i.id for i in fold(read_all(b)).live()} == {x, y}
+
+
+def test_sync_refreshes_both_caches(a, b):
+    x = add_item(a, b"from a", name="A.JPG")
+    y = add_item(b, b"from b", name="B.JPG")
+    run(a, b, NOW)
+    for lib in (a, b):
+        assert sorted(i["id"] for i in Cache(lib).items_json()) == sorted([x, y])
 
 
 def test_trash_on_one_side_moves_file_on_the_other(a, b):

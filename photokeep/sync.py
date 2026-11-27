@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import NamedTuple
 
 from photokeep import events, fsops
+from photokeep.cache import Cache
 from photokeep.events import LogCorrupt, encode, new_event, ordered, parse_log, read_all, ts_str
 from photokeep.fsops import LayoutPlan, apply_layout, inside, plan_layout, scan
 from photokeep.hashcache import HashCache
@@ -254,10 +255,6 @@ def _restore_app(lib: Library) -> None:
         shutil.rmtree(work)
 
 
-def after_sync(lib: Library) -> None:
-    """Refresh a synced copy's derived caches; none exist yet beyond the hash cache, which scan keeps current."""
-
-
 def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> SyncPlan:
     """Sync both copies both ways; with update_app, also copy the newer app/ over the older one.
 
@@ -287,6 +284,8 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
         pending = plan_layout(a, state, scan(a)), plan_layout(b, state, scan(b))
         if ends:
             _replace_app(*ends)
+        # The viewer's index follows the new state; rendering new thumbnails takes minutes and waits for
+        # `photokeep cache refresh`.
         for lib in (a, b):
-            after_sync(lib)
+            Cache(lib).refresh(render=False)
     return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, app, neither, pending, bad)

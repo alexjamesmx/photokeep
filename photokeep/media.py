@@ -64,8 +64,9 @@ def _atomic(dst: Path, write) -> None:
         raise
 
 
-def _rel(kind: str, item_id: str, out_dir: Path) -> Path:
-    return out_dir / kind / item_id[:2] / f"{item_id}.jpg"
+def cache_path(folder: str, item_id: str, out_dir: Path) -> Path:
+    """Where render puts an item's thumbnail (folder "thumbs") or preview ("previews")."""
+    return out_dir / folder / item_id[:2] / f"{item_id}.jpg"
 
 
 def _save_thumb(im, dst: Path):
@@ -104,10 +105,10 @@ def _render_photo(item_id: str, src: Path, ext: str, out_dir: Path) -> dict:
         if ext == ".heic":
             p = im.copy()
             p.thumbnail((PREVIEW_LONG, PREVIEW_LONG), Image.LANCZOS)
-            _atomic(_rel("previews", item_id, out_dir),
+            _atomic(cache_path("previews", item_id, out_dir),
                     lambda t: p.save(t, "JPEG", quality=82, optimize=True, progressive=True))
             res["preview"] = 1
-        res.update(metrics(_save_thumb(im, _rel("thumbs", item_id, out_dir))))
+        res.update(metrics(_save_thumb(im, cache_path("thumbs", item_id, out_dir))))
     res["thumb"] = 1
     return res
 
@@ -126,7 +127,7 @@ def _render_video(item_id: str, src: Path, duration: float | None, out_dir: Path
 
     for at in (min(1.0, (duration or 0) * 0.3), 0):
         try:
-            _atomic(_rel("thumbs", item_id, out_dir), poster(at))
+            _atomic(cache_path("thumbs", item_id, out_dir), poster(at))
             return {"thumb": 1}
         except RuntimeError as e:
             err = e

@@ -59,6 +59,14 @@ class Library:
         self.cache.mkdir(exist_ok=True)
         return self.cache
 
+    def cache_db(self, name: str) -> Path:
+        """cache/<name> for SQLite, refused when it or a journal beside it is a symlink: writes would follow it."""
+        path = self.cache_dir() / name
+        for p in (path, *(path.with_name(name + s) for s in ("-wal", "-shm", "-journal"))):
+            if p.is_symlink():
+                raise LibraryError(f"{p} is a symlink; a cache file must be a real file")
+        return path
+
 
 def _check_folder(path: Path, may_be_missing: bool = False) -> None:
     # A library folder that is a symlink would send writes and deletes wherever it points.

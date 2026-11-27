@@ -1,8 +1,10 @@
-import io
+import sys
+import time
 
 import pytest
 
 from photokeep.library import init_copy, init_library
+from tests.helpers import jpeg_bytes
 
 
 @pytest.fixture
@@ -22,8 +24,16 @@ def b(tmp_path, a):
 
 @pytest.fixture
 def jpeg() -> bytes:
-    from PIL import Image
+    return jpeg_bytes()
 
-    buf = io.BytesIO()
-    Image.new("RGB", (8, 8), (200, 80, 40)).save(buf, "JPEG")
-    return buf.getvalue()
+
+@pytest.fixture
+def mexico(monkeypatch):
+    """Local zone America/Mexico_City (UTC-6, no DST since 2022), for dates shown in local time."""
+    if sys.platform == "win32":
+        pytest.skip("time.tzset is not available on Windows")
+    monkeypatch.setenv("TZ", "America/Mexico_City")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()

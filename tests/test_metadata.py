@@ -1,20 +1,6 @@
-import sys
-import time
-
 import pytest
 
 from photokeep.metadata import derive, fingerprint
-
-
-@pytest.fixture
-def mexico(monkeypatch):
-    if sys.platform == "win32":
-        pytest.skip("time.tzset is not available on Windows")
-    monkeypatch.setenv("TZ", "America/Mexico_City")
-    time.tzset()
-    yield
-    monkeypatch.undo()
-    time.tzset()
 
 
 def test_exif_date_with_offset():

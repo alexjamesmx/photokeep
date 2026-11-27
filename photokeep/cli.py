@@ -5,7 +5,8 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
 
-from photokeep import __version__, status, sync, verify
+from photokeep import __version__, media, status, sync, verify
+from photokeep.cache import Cache
 from photokeep.events import LogCorrupt
 from photokeep.fsops import CopyError
 from photokeep.library import LibraryError, init_copy, init_library, open_library
@@ -169,9 +170,33 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cache_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("action", choices=["refresh"])
+    _copy_arg(p)
+    p.add_argument("--no-render", action="store_true", help="rebuild the index only; render no thumbnails")
+
+
+def cmd_cache(args: argparse.Namespace) -> int:
+    """Rebuild a copy's viewer index and render missing thumbnails (`cache refresh`)."""
+    try:
+        counts = Cache(open_library(args.copy)).refresh(render=not args.no_render)
+    except (LibraryError, LogCorrupt, OSError) as e:
+        print(f"photokeep: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps(counts))
+        return 0
+    print("\n".join(f"{what.replace('_', ' ')}: {n}" for what, n in counts.items()))
+    missing = media.available()[1]
+    if counts["skipped_render"] and not args.no_render and missing:
+        print(f"to render thumbnails, install: {', '.join(missing)}")
+    return 0
+
+
 COMMANDS["verify"], ARGUMENTS["verify"] = cmd_verify, _verify_args
 COMMANDS["repair"], ARGUMENTS["repair"] = cmd_repair, _repair_args
 COMMANDS["status"], ARGUMENTS["status"] = cmd_status, _copy_arg
+COMMANDS["cache"], ARGUMENTS["cache"] = cmd_cache, _cache_args
 
 
 def build_parser() -> argparse.ArgumentParser:
