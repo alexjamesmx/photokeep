@@ -153,6 +153,110 @@ def _version_of(state: State, fp: tuple | None, apart: Collection[str]) -> str |
     return min(live, key=lambda i: (i.first_ts, i.id)).id if live else None
 
 
+@dataclass
+class _Run:
+    """What one plan() call decides from, and what it has decided so far."""
+    state: State
+    shas: dict[str, str]
+    import_of: dict[str, str]
+    meta: dict[str, dict]  # display metadata of each candidate read, by source path
+    problems: list[dict]
+    live_files: set[str]  # SHA-256 of every file of a live item
+    gone: set[str]  # SHA-256 of every file of a blocked item
+    batches: set[str]  # this source's import ids: earlier runs' and this one's
+    apart: dict[str, set[str]]  # see _apart
+    deleted: set[str] = field(default_factory=set)  # SHA-256 of the copies of what the library deleted
+    items: dict[str, Planned] = field(default_factory=dict)
+    met: set[str] = field(default_factory=set)  # SHA-256 of every copy taken so far
+    # fingerprint -> the first item this import adds with it, edits aside
+    first_with: dict[tuple, str] = field(default_factory=dict)
+    alone: list[Candidate] = field(default_factory=list)  # clips that no item can take: kept as items of their own
+    outcome: dict[str, str] = field(default_factory=dict)
+
+
+def _blocked(run: _Run, sha: str, fp: tuple | None = None) -> bool:
+    known = run.state.items.get(sha)
+    # A known item is judged by its own state, as fold does: versions share fingerprints.
+    return known.blocked if known else sha in run.gone or run.state.is_blocked(sha, fp)
+
+
+def _new(run: _Run, c: Candidate, sha: str, fp: tuple | None, known: Item | None, own_clip: bool) -> Planned:
+    """The plan of an item whose first copy is c: one this import adds, linked to another version of it, or one the
+    library holds."""
+    # An item this source made may still be trashed: a run cut off mid-append wrote its import only.
+    it = run.items[sha] = Planned(sha, known, trashed=c.trashed and (not known or known.imports[0] in run.batches))
+    if own_clip and not known:
+        run.problems.append(problem(c, "clip kept as its own item"))
+    if not known:
+        mine = run.apart.get(sha, set())
+        earlier = run.first_with.get(fp) if fp else None
+        it.version_of = _version_of(run.state, fp, mine) or (earlier if earlier not in mine else None)
+        if fp and not c.edit_of:
+            run.first_with.setdefault(fp, sha)
+    return it
+
+
+def _add_copy(it: Planned, c: Candidate, import_id: str, m: dict, fp: tuple | None) -> None:
+    """A copy's source reference and marks on its item."""
+    # A copy whose import the log records already brings only its marks, which events_of filters.
+    if not (it.known and import_id in it.known.imports) and import_id not in {s.import_id for s in it.sources}:
+        it.sources.append(Source(c, import_id, folder_of(m["taken"]), list(fp) if fp else None))
+    it.albums.update(c.albums)
+    it.favorite, it.trashed = it.favorite or c.favorite, it.trashed and c.trashed
+
+
+def _held_clip(run: _Run, clip: tuple[Candidate, str], live: str | None, verdict: str) -> None:
+    """The clip of a photo whose item exists already counts by its own bytes. An item without a clip cannot take
+    one later, so the clip becomes an item of its own; one with another clip keeps that one."""
+    if clip[1] in run.live_files or clip[1] == live:
+        run.outcome[clip[0].source_path] = verdict
+    elif live is None:
+        run.alone.append(clip[0])
+    else:
+        run.outcome[clip[0].source_path] = "problem"
+        run.problems.append(problem(clip[0], "clip not in library"))
+
+
+def _take_clip(run: _Run, it: Planned | None, known: Item | None, clip: tuple[Candidate, str], verdict: str) -> None:
+    """A photo's Live clip, beside the item its photo went to (verdict)."""
+    if it and not it.known:  # an item this import adds: a clip only one copy has is not lost
+        if it.clip is None:
+            it.clip, run.outcome[clip[0].source_path] = clip, "live_clips"
+        elif it.clip[1] == clip[1]:
+            run.outcome[clip[0].source_path] = "duplicates_in_source"
+        else:
+            run.outcome[clip[0].source_path] = "problem"
+            run.problems.append(problem(clip[0], "clip not in library"))
+    else:
+        live = next((f["sha256"] for f in known.files if f["role"] == "live"), None) if known else None
+        _held_clip(run, clip, live, verdict)
+
+
+def _take(run: _Run, c: Candidate, clip: tuple[Candidate, str] | None, own_clip: bool = False) -> None:
+    """One copy, with its Live clip: skipped as deleted, or recorded on its item."""
+    sha, import_id, m = run.shas[c.source_path], run.import_of[c.source_path], run.meta[c.source_path]
+    fp = fingerprint(m)
+    if sha in run.deleted or _blocked(run, sha, fp):
+        run.outcome.update(dict.fromkeys([c.source_path, *([clip[0].source_path] if clip else [])], "skipped_deleted"))
+        return
+    if clip and _blocked(run, clip[1]):
+        run.outcome[clip[0].source_path] = "skipped_deleted"
+        clip = None
+    state = run.state
+    known = state.items[sha] if sha in state.items and state.items[sha].status == "live" else None
+    it, first = run.items.get(sha), sha not in run.met
+    run.met.add(sha)
+    verdict = ("already_in_library" if known or sha in run.live_files else "imported") if first \
+        else "duplicates_in_source"
+    run.outcome[c.source_path] = verdict
+    if known or it or sha not in run.live_files:  # else the bytes are another item's clip: no item to record
+        if it is None:
+            it = _new(run, c, sha, fp, known, own_clip)
+        _add_copy(it, c, import_id, m, fp)
+    if clip:
+        _take_clip(run, it, known, clip, verdict)
+
+
 def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: dict[str, dict],
          import_of: dict[str, str], clips: dict[str, Candidate], unread: dict[str, str],
          problems: list[dict]) -> tuple[list[Planned], dict[str, str]]:
@@ -165,92 +269,23 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
     attached = {c.source_path for c in clips.values()}
     meta = {c.source_path: derive(exif.get(c.source_path, {}), c.provider, c.name, c.mtime)
             for c in candidates if c.source_path in shas}
-    live_files = {f["sha256"] for i in state.items.values() if i.status == "live" for f in i.files}
-    gone = {f["sha256"] for i in state.items.values() if i.blocked for f in i.files}
-
-    def blocked(sha: str, fp: tuple | None = None) -> bool:
-        known = state.items.get(sha)
-        # A known item is judged by its own state, as fold does: versions share fingerprints.
-        return known.blocked if known else sha in gone or state.is_blocked(sha, fp)
-
+    run = _Run(state, shas, import_of, meta, problems,
+               live_files={f["sha256"] for i in state.items.values() if i.status == "live" for f in i.files},
+               gone={f["sha256"] for i in state.items.values() if i.blocked for f in i.files},
+               batches=set(import_of.values()), apart=_apart(candidates, shas))
     # Decided once per SHA-256: one copy's fingerprint can match a deleted photo while another copy has no date.
-    deleted = {shas[p] for p, m in meta.items() if p not in attached and blocked(shas[p], fingerprint(m))}
-    batches = set(import_of.values())  # this source's import ids: earlier runs' and this one's
-    apart = _apart(candidates, shas)
-    items: dict[str, Planned] = {}
-    met: set[str] = set()  # SHA-256 of every copy taken so far
-    first_with: dict[tuple, str] = {}  # fingerprint -> the first item this import adds with it, edits aside
-    alone: list[Candidate] = []  # clips that no item can take: kept as items of their own
-    outcome: dict[str, str] = {}
-
-    def held_clip(clip: tuple[Candidate, str], live: str | None, verdict: str) -> None:
-        """The clip of a photo whose item exists already counts by its own bytes. An item without a clip cannot
-        take one later, so the clip becomes an item of its own; one with another clip keeps that one."""
-        if clip[1] in live_files or clip[1] == live:
-            outcome[clip[0].source_path] = verdict
-        elif live is None:
-            alone.append(clip[0])
-        else:
-            outcome[clip[0].source_path] = "problem"
-            problems.append(problem(clip[0], "clip not in library"))
-
-    def take(c: Candidate, clip: tuple[Candidate, str] | None, own_clip: bool = False) -> None:
-        sha, import_id, m = shas[c.source_path], import_of[c.source_path], meta[c.source_path]
-        fp = fingerprint(m)
-        if sha in deleted or blocked(sha, fp):
-            outcome.update(dict.fromkeys([c.source_path, *([clip[0].source_path] if clip else [])], "skipped_deleted"))
-            return
-        if clip and blocked(clip[1]):
-            outcome[clip[0].source_path] = "skipped_deleted"
-            clip = None
-        known = state.items[sha] if sha in state.items and state.items[sha].status == "live" else None
-        it, first = items.get(sha), sha not in met
-        met.add(sha)
-        verdict = ("already_in_library" if known or sha in live_files else "imported") if first \
-            else "duplicates_in_source"
-        outcome[c.source_path] = verdict
-        if known or it or sha not in live_files:  # else the bytes are another item's clip: no item to record
-            if it is None:
-                # An item this source made may still be trashed: a run cut off mid-append wrote its import only.
-                it = items[sha] = Planned(sha, known, trashed=c.trashed and (not known or known.imports[0] in batches))
-                if own_clip and not known:
-                    problems.append(problem(c, "clip kept as its own item"))
-                if not known:
-                    mine = apart.get(sha, set())
-                    earlier = first_with.get(fp) if fp else None
-                    it.version_of = _version_of(state, fp, mine) or (earlier if earlier not in mine else None)
-                    if fp and not c.edit_of:
-                        first_with.setdefault(fp, sha)
-            # A copy whose import the log records already brings only its marks, which events_of filters.
-            if not (known and import_id in known.imports) and import_id not in {s.import_id for s in it.sources}:
-                it.sources.append(Source(c, import_id, folder_of(m["taken"]), list(fp) if fp else None))
-            it.albums.update(c.albums)
-            it.favorite, it.trashed = it.favorite or c.favorite, it.trashed and c.trashed
-        if clip is None:
-            return
-        if it and not it.known:  # an item this import adds: a clip only one copy has is not lost
-            if it.clip is None:
-                it.clip, outcome[clip[0].source_path] = clip, "live_clips"
-            elif it.clip[1] == clip[1]:
-                outcome[clip[0].source_path] = "duplicates_in_source"
-            else:
-                outcome[clip[0].source_path] = "problem"
-                problems.append(problem(clip[0], "clip not in library"))
-        else:
-            live = next((f["sha256"] for f in known.files if f["role"] == "live"), None) if known else None
-            held_clip(clip, live, verdict)
-
+    run.deleted = {shas[p] for p, m in meta.items() if p not in attached and _blocked(run, shas[p], fingerprint(m))}
     for c in candidates:
         found = clips.get(c.source_path)
         if c.source_path in shas and c.source_path not in attached:
-            take(c, (found, shas[found.source_path]) if found and found.source_path in shas else None)
+            _take(run, c, (found, shas[found.source_path]) if found and found.source_path in shas else None)
         elif found and found.source_path in shas and c.source_path not in shas:  # the photo could not be read
-            alone.append(found)
-    for clip in alone:
-        take(clip, None, own_clip=True)
-    _link_edits(state, items, shas, unread, problems)
-    _notes(items.values(), candidates, problems)
-    return list(items.values()), outcome
+            run.alone.append(found)
+    for clip in run.alone:
+        _take(run, clip, None, own_clip=True)
+    _link_edits(state, run.items, shas, unread, problems)
+    _notes(run.items.values(), candidates, problems)
+    return list(run.items.values()), run.outcome
 
 
 def _notes(items: Collection[Planned], candidates: list[Candidate], problems: list[dict]) -> None:
