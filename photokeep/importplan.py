@@ -29,6 +29,7 @@ class Candidate:
     favorite: bool = False
     live_of: str | None = None  # source_path of the photo this clip belongs to
     edit_of: str | None = None  # source_path of the original
+    note: str | None = None  # a problem the adapter found (a Takeout file without its sidecar), listed as one
 
 
 @dataclass(frozen=True)
@@ -140,6 +141,7 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
     shas, exif and import_of (the import id that records it) are by source path, for every candidate read;
     unread holds why each of the others could not be.
     """
+    problems += [problem(c, c.note) for c in candidates if c.note]
     problems += _unread(candidates, unread, shas, clips)
     attached = {c.source_path for c in clips.values()}
     meta = {c.source_path: derive(exif.get(c.source_path, {}), c.provider, c.name, c.mtime)
