@@ -18,6 +18,7 @@ _VERSION = re.compile(r"""^__version__\s*=\s*["']([0-9]+(?:\.[0-9]+)*)["']""", r
 
 Found = dict[str, list[str]]  # what scan returns: sha -> paths
 Files = list[tuple[str, str]]  # (sha, expected path)
+Failures = list[tuple[str, str, str]]  # (side, path, reason): files that side's disk refused, left for the next run
 
 
 def _version_key(version: str) -> tuple[int, ...]:
@@ -55,6 +56,7 @@ class SyncPlan:
     sources_a_to_b: list[str] = field(default_factory=list)  # files under sources/ filled on b from a
     sources_b_to_a: list[str] = field(default_factory=list)
     sources_conflicts: list[str] = field(default_factory=list)  # under sources/: different bytes, a symlink or not ours
+    failed: Failures = field(default_factory=list)
 
     def summary(self) -> dict:
         # Conflicts are counted where they stand last: after a run, in the fresh plans.
@@ -72,6 +74,7 @@ class SyncPlan:
             "app": self.app.to_json(),
             "conflicts": sum(len(p.conflicts) for p in final),
             "bad_sources": [{"side": side, "path": path, "sha": sha} for side, path, sha in self.bad_sources],
+            "failed": [{"side": side, "path": path, "reason": reason} for side, path, reason in self.failed],
             "pending": {"a": self.pending[0].summary(), "b": self.pending[1].summary()} if self.pending else None,
         }
 
@@ -208,15 +211,20 @@ def plan(a: Library, b: Library, now: datetime) -> SyncPlan:
                     sources_conflicts=sources.conflicts)
 
 
-def _arrange(lib: Library, state: State) -> LayoutPlan:
+def _arrange(lib: Library, side: str, state: State) -> tuple[LayoutPlan, Failures]:
     layout = plan_layout(lib, state, scan(lib))
-    apply_layout(lib, layout)
-    return layout
+    return layout, [(side, path, reason) for path, reason in apply_layout(lib, layout)]
 
 
-def _copy(src: Library, dst: Library, side: str, found: Found, todo: Files) -> list[tuple[str, str, str]]:
-    """Fill dst's missing files from src; return the sources skipped because their bytes are not the expected ones."""
-    bad = []
+class _Filled(NamedTuple):
+    bad: list[tuple[str, str, str]]  # (side, path, expected sha): sources whose bytes are not the expected ones
+    failed: Failures
+
+
+def _copy(src: Library, dst: Library, sides: tuple[str, str], found: Found, todo: Files) -> _Filled:
+    """Fill dst's missing files from src; one file that cannot be read or written never stops the rest."""
+    bad: list[tuple[str, str, str]] = []
+    failed: Failures = []
     with HashCache(dst) as cache:
         for sha, rel in todo:
             source, target = found[sha][0], dst.root / rel
@@ -225,10 +233,13 @@ def _copy(src: Library, dst: Library, side: str, found: Found, todo: Files) -> l
             try:
                 fsops.copy_verified(src.root / source, target, sha)
             except fsops.HashMismatch:  # rotted source: the rest is still worth copying
-                bad.append((side, source, sha))
+                bad.append((sides[0], source, sha))
+                continue
+            except (fsops.CopyError, OSError) as e:
+                failed.append((sides[1], rel, fsops.failure(e)))
                 continue
             cache.record(target, sha)  # verified while copying: the next scan need not read it again
-    return bad
+    return _Filled(bad, failed)
 
 
 def _replace_app(src: Library, dst: Library) -> None:
@@ -255,14 +266,14 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
         events.append(a, _purge_events(a, due, now))
         transfers += exchange_logs(a, b, dry_run=False)
         sources = sync_sources.compare(a, b)
-        to_b, to_a = sync_sources.copy(a, b, "a", sources.a_to_b), sync_sources.copy(b, a, "b", sources.b_to_a)
-        bad = to_b.bad + to_a.bad
+        to_b = sync_sources.copy(a, b, ("a", "b"), sources.a_to_b)
+        to_a = sync_sources.copy(b, a, ("b", "a"), sources.b_to_a)
         state = fold(read_all(a))
         # Arrange before copying: a move on one side can free the path a copied file has to take.
-        layouts = _arrange(a, state), _arrange(b, state)
+        (layout_a, moves_a), (layout_b, moves_b) = _arrange(a, "a", state), _arrange(b, "b", state)
         found = scan(a), scan(b)
         a_to_b, b_to_a, neither = _fills((plan_layout(a, state, found[0]), plan_layout(b, state, found[1])), found)
-        bad += _copy(a, b, "a", found[0], a_to_b) + _copy(b, a, "b", found[1], b_to_a)
+        filled = _copy(a, b, ("a", "b"), found[0], a_to_b), _copy(b, a, ("b", "a"), found[1], b_to_a)
         # apply_layout skips steps whose files changed meanwhile; fresh plans show what is left.
         pending = plan_layout(a, state, scan(a)), plan_layout(b, state, scan(b))
         if ends:
@@ -271,5 +282,7 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
         # `photokeep cache refresh`.
         for lib in (a, b):
             Cache(lib).refresh(render=False)
-    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, *layouts, app, neither, pending, bad,
-                    to_b.done, to_a.done, sorted(sources.conflicts + to_b.conflicts + to_a.conflicts))
+    return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, layout_a, layout_b, app, neither, pending,
+                    to_b.bad + to_a.bad + filled[0].bad + filled[1].bad, to_b.done, to_a.done,
+                    sorted(sources.conflicts + to_b.conflicts + to_a.conflicts),
+                    to_b.failed + to_a.failed + moves_a + moves_b + filled[0].failed + filled[1].failed)

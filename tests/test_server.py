@@ -1,6 +1,7 @@
 import gzip
 import http.client
 import json
+import os
 import socket
 import sqlite3
 import threading
@@ -143,6 +144,23 @@ def test_failed_move_is_finished_by_a_retry(served, monkeypatch):
     monkeypatch.undo()
     client.post("/api/trash", ids=[item])  # nothing left to log, but the move is still owed
     assert (lib.trash / item / "IMG_1.JPG").is_file() and [e["op"] for e in read_all(lib)].count("trash") == 1
+
+
+def test_a_move_the_disk_refuses_is_shown_and_finished_by_a_retry(served, monkeypatch):
+    lib, client, item = served
+    real = os.replace
+
+    def refuse(src, dst):
+        if os.path.basename(dst) == "IMG_1.JPG":
+            raise OSError(22, "Invalid argument", dst)
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", refuse)
+    status, _, data = client.send("/api/trash", json.dumps({"ids": [item]}))
+    assert status == 500 and "Invalid argument" in json.loads(data)["error"]
+    monkeypatch.undo()
+    client.post("/api/trash", ids=[item])
+    assert (lib.trash / item / "IMG_1.JPG").is_file()
 
 
 def test_failed_index_update_is_rebuilt_on_the_next_request(served, monkeypatch):

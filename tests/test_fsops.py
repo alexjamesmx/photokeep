@@ -1,3 +1,4 @@
+import errno
 import os
 
 import pytest
@@ -267,3 +268,32 @@ def test_symlinked_originals_folder_is_never_written(lib, jpeg, tmp_path):
     apply_layout(lib, plan)
     assert (elsewhere / "2024/01/A.JPG").read_bytes() == jpeg and (elsewhere / "empty").is_dir()
     assert list(lib.trash.iterdir()) == []
+
+
+def _refuse_moves_to(monkeypatch, name: str, code: int) -> None:
+    real = os.replace
+
+    def replace(src, dst):
+        if os.path.basename(dst) == name:
+            raise OSError(code, os.strerror(code), dst)
+        real(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+
+
+def test_a_move_that_fails_is_listed_and_the_rest_done(lib, monkeypatch):
+    for data, name in ((b"first", "A.JPG"), (b"second", "B.JPG")):
+        put(lib, f"originals/2024/01/{name}", data)
+        state = state_with(lib, data, name=name, trashed=True)
+    _refuse_moves_to(monkeypatch, "A.JPG", errno.EINVAL)
+    failed = apply_layout(lib, plan_layout(lib, state, scan(lib)))
+    assert [path for path, _ in failed] == ["originals/2024/01/A.JPG"] and "Invalid argument" in failed[0][1]
+    assert (lib.trash / sha(b"second") / "B.JPG").is_file() and (lib.originals / "2024/01/A.JPG").is_file()
+
+
+def test_a_full_disk_stops_the_layout(lib, monkeypatch):
+    put(lib, "originals/2024/01/A.JPG", b"first")
+    state = state_with(lib, b"first", name="A.JPG", trashed=True)
+    _refuse_moves_to(monkeypatch, "A.JPG", errno.ENOSPC)
+    with pytest.raises(OSError, match="No space"):
+        apply_layout(lib, plan_layout(lib, state, scan(lib)))

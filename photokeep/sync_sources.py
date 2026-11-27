@@ -83,13 +83,16 @@ def _linked(dst: Library, rel: str) -> bool:
 class Copied(NamedTuple):
     done: list[str]
     bad: list[tuple[str, str, str]]  # (side, path, expected sha): the source's bytes were not the expected ones
-    conflicts: list[str]  # refused or failed, with the reason
+    conflicts: list[str]  # refused: a link or a file on the way
+    failed: list[tuple[str, str, str]]  # (side, path, reason): the destination did not take the file
 
 
-def copy(src: Library, dst: Library, side: str, todo: dict[str, str]) -> Copied:
+def copy(src: Library, dst: Library, sides: tuple[str, str], todo: dict[str, str]) -> Copied:
+    """Fill dst's sources/ from src; one file that cannot be read or written never stops the rest."""
     done: list[str] = []
     bad: list[tuple[str, str, str]] = []
     conflicts: list[str] = []
+    failed: list[tuple[str, str, str]] = []
     for rel, sha in todo.items():
         if _linked(dst, rel):  # planned before a link could appear: never write through one
             conflicts.append(rel)
@@ -97,9 +100,9 @@ def copy(src: Library, dst: Library, side: str, todo: dict[str, str]) -> Copied:
         try:
             fsops.copy_verified(src.sources / rel, dst.sources / rel, sha)
         except fsops.HashMismatch:
-            bad.append((side, f"sources/{rel}", sha))
-        except OSError as e:  # e.g. a name the other filesystem cannot hold
-            conflicts.append(f"{rel}: {e}")
+            bad.append((sides[0], f"sources/{rel}", sha))
+        except (fsops.CopyError, OSError) as e:  # e.g. a name the other filesystem cannot hold
+            failed.append((sides[1], f"sources/{rel}", fsops.failure(e)))
         else:
             done.append(rel)
-    return Copied(done, bad, conflicts)
+    return Copied(done, bad, conflicts, failed)

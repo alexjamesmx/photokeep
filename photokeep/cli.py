@@ -82,6 +82,7 @@ def _app_text(app: dict, dry_run: bool, update_app: bool) -> str:
 
 def _sync_text(s: dict, dry_run: bool, update_app: bool) -> str:
     bad = [f"{b['side']}:{b['path']}" for b in s["bad_sources"]]
+    failed = [f"{f['side']}:{f['path']}: {f['reason']}" for f in s["failed"]]
     lines = [
         f"logs: {len(s['logs'])} files, {sum(size for *_, size in s['logs'])} bytes",
         f"files: {s['copy_a_to_b']} a->b, {s['copy_b_to_a']} b->a",
@@ -92,6 +93,7 @@ def _sync_text(s: dict, dry_run: bool, update_app: bool) -> str:
         f"sources conflicts: {_some(s['sources']['conflicts'])}",
         f"missing on both: {s['missing_both']}",
         f"bad sources: {_some(bad)}",
+        f"failed: {_some(failed)}",
         _app_text(s["app"], dry_run, update_app),
         f"conflicts: {s['conflicts']}",
     ]
@@ -116,7 +118,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     summary = result.summary()
     print(json.dumps(summary) if args.json else _sync_text(summary, not args.yes, args.update_app))
     # Exit 2: sync finished, but the copies could not be made whole and the owner has to look.
-    problems = (summary["conflicts"], summary["missing_both"], summary["bad_sources"], summary["sources"]["conflicts"])
+    problems = (summary["conflicts"], summary["missing_both"], summary["bad_sources"], summary["sources"]["conflicts"],
+                summary["failed"])
     return 2 if any(problems) else 0
 
 

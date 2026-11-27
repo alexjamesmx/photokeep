@@ -126,7 +126,10 @@ class Viewer:
             # Favorites move nothing, and scanning every file is most of a write's time. Every other action
             # lays the files out even when it logs nothing new: a retry then finishes a move that failed.
             if action != "favorite":
-                apply_layout(self.lib, plan_layout(self.lib, self.state, scan(self.lib)))
+                failed = apply_layout(self.lib, plan_layout(self.lib, self.state, scan(self.lib)))
+                if failed:  # shown in the page; the next request retries the move
+                    path, reason = failed[0]
+                    raise OSError(f"{len(failed)} files could not be moved, first {path}: {reason}")
             rows = self.cache.items_json(touched)
         return {"items": rows, "gone": sorted(touched - {r["id"] for r in rows})}
 

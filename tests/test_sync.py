@@ -1,3 +1,4 @@
+import errno
 import json
 import os
 from datetime import UTC, datetime, timedelta
@@ -110,12 +111,42 @@ def test_rerun_after_interrupted_copy_completes(a, b, monkeypatch):
     for n in range(3):
         add_item(a, f"photo {n}".encode(), name=f"P{n}.JPG")
     monkeypatch.setattr(fsops, "copy_verified", fail_after(1))
-    with pytest.raises(CopyError):
-        run(a, b, NOW)
-    assert not no_part_files(b)
+    failed = run(a, b, NOW).summary()["failed"]
+    assert [(f["side"], f["path"]) for f in failed] == [("b", f"originals/2024/01/P{n}.JPG") for n in (1, 2)]
+    assert "device disappeared" in failed[0]["reason"]
     monkeypatch.undo()
-    run(a, b, NOW)
+    assert run(a, b, NOW).summary()["failed"] == []
     assert files_of(a) == files_of(b) and len(files_of(b)) == 3 and no_part_files(a, b)
+
+
+def test_a_file_that_cannot_be_written_is_listed_and_the_rest_synced(a, b, monkeypatch, capsys):
+    add_item(a, b"odd", name="A.JPG")
+    add_item(a, b"fine", name="B.JPG")
+    real = fsops.copy_verified
+
+    def copy(src, dst, digest):
+        if dst.name == "A.JPG":
+            raise OSError(22, "Invalid argument", str(dst))
+        real(src, dst, digest)
+
+    monkeypatch.setattr(fsops, "copy_verified", copy)
+    assert main(["sync", str(a.root), str(b.root), "--yes", "--json"]) == 2
+    [failed] = json.loads(capsys.readouterr().out)["failed"]
+    assert (failed["side"], failed["path"]) == ("b", "originals/2024/01/A.JPG") and "Invalid" in failed["reason"]
+    assert files_of(b) == {"originals/2024/01/B.JPG": b"fine"}
+    assert main(["sync", str(a.root), str(b.root), "--yes"]) == 2
+    assert "failed: 1 (b:originals/2024/01/A.JPG" in capsys.readouterr().out
+
+
+def test_a_full_disk_stops_the_sync(a, b, monkeypatch):
+    add_item(a, b"photo", name="A.JPG")
+
+    def full(src, dst, digest):
+        raise OSError(errno.ENOSPC, "No space left on device", str(dst))
+
+    monkeypatch.setattr(fsops, "copy_verified", full)
+    with pytest.raises(OSError, match="No space"):
+        run(a, b, NOW)
 
 
 def test_diverged_logs_stop_and_change_nothing(a, b):
@@ -457,8 +488,7 @@ def test_foreign_names_and_part_files_in_sources_are_not_copied(a, b):
 def test_interrupted_sources_copy_resumes(a, b, monkeypatch):
     add_source(a, IMPORT, {"part1/Photos/IMG_1.JPG": b"x"})
     monkeypatch.setattr(fsops, "copy_verified", fail_after(1))
-    with pytest.raises(CopyError):
-        run(a, b, NOW)
+    assert [f["path"] for f in run(a, b, NOW).summary()["failed"]] == [f"sources/{IMPORT}/manifest.json"]
     monkeypatch.undo()
     run(a, b, NOW)
     assert sources_of(b) == sources_of(a) and no_part_files(a, b)
@@ -523,7 +553,8 @@ def test_unwritable_source_name_is_reported_and_the_rest_synced(a, b, monkeypatc
 
     monkeypatch.setattr(fsops, "copy_verified", copy)
     s = run(a, b, NOW).summary()
-    assert s["sources"] == {"a_to_b": 1, "b_to_a": 0, "conflicts": [f"{IMPORT}/odd.txt: invalid name"]}
+    assert s["sources"] == {"a_to_b": 1, "b_to_a": 0, "conflicts": []}
+    assert s["failed"] == [{"side": "b", "path": f"sources/{IMPORT}/odd.txt", "reason": "invalid name"}]
     assert files_of(b) == {"originals/2024/01/A.JPG": b"photo"} and sources_of(b) == {f"{IMPORT}/fine.txt": b"y"}
 
 
