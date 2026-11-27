@@ -1,9 +1,10 @@
-"""What an import does, decided without touching disk: from the folded state and each candidate's SHA-256 and
-EXIF, the items it adds, the live ones it records another source of, what it skips, and the events that say so.
+"""What an import does, decided without touching disk: from the log, the folded state and each candidate's
+SHA-256 and EXIF, the items it adds, the live ones it records another source of, what it skips, and the events
+that say so.
 """
 from collections import Counter
-from collections.abc import Callable
-from dataclasses import dataclass
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import BinaryIO
 
@@ -37,25 +38,60 @@ class SourceFile:
     read: Callable[[], bytes]
 
 
-@dataclass
-class Planned:
-    """An item the import adds, or a live one the library holds (known), of which this is another source."""
-    main: Candidate
-    sha: str
+@dataclass(frozen=True)
+class Source:
+    """One import's record of an item: an import event naming the copy that import holds."""
+    copy: Candidate
     import_id: str
     folder: str
     fingerprint: list | None
+
+
+@dataclass
+class Planned:
+    """An item the import adds, or a live one the library holds (known), with every import that records it
+    here and the marks its copies carry."""
+    sha: str
     known: Item | None
-    albums: set[str]
-    favorite: bool
-    trashed: bool  # every copy is in the provider's trash; never for a known item
-    clip: tuple[Candidate, str] | None = None  # the Live clip and its SHA-256
+    sources: list[Source] = field(default_factory=list)  # the first one creates a new item
+    albums: set[str] = field(default_factory=set)
+    favorite: bool = False
+    trashed: bool = False  # every copy is in the provider's trash; never for a known item
+    clip: tuple[Candidate, str] | None = None  # a new item's Live clip and its SHA-256
     version_of: str | None = None
     edit_of: str | None = None
 
+    @property
+    def main(self) -> Candidate:
+        return self.sources[0].copy
+
     def files(self) -> list[tuple[str, Candidate, str]]:
-        """(role, candidate, SHA-256) of each file, the main one first."""
+        """(role, candidate, SHA-256) of each file a new item puts in place, the main one first."""
         return [("main", self.main, self.sha), *([("live", *self.clip)] if self.clip else [])]
+
+
+@dataclass(frozen=True)
+class Touched:
+    """Marks the log has ever set or cleared on an item, which a later source never sets again: a mark the owner
+    took off stays off."""
+    favorite: frozenset[str]  # items
+    albums: frozenset[tuple[str, str]]  # (item, title)
+    renamed: frozenset[str]  # titles an album was renamed from
+
+    @classmethod
+    def of(cls, log: Iterable[dict]) -> "Touched":
+        favorite, albums, renamed = set(), set(), set()
+        for e in log:
+            if e["op"] in ("favorite", "unfavorite"):
+                favorite.add(e["item"])
+            elif e["op"] in ("album.add", "album.remove") and e["kind"] == "album":
+                albums.add((e["item"], e["album"]))
+            elif e["op"] == "album.rename" and e["kind"] == "album":
+                renamed.add(e["album"])
+        return cls(frozenset(favorite), frozenset(albums), frozenset(renamed))
+
+    def album(self, item: str, title: str) -> bool:
+        return (item, title) in self.albums or title in self.renamed
 
 
 def problem(c: Candidate, reason: str) -> dict:
@@ -72,21 +108,22 @@ def clips_of(candidates: list[Candidate]) -> dict[str, Candidate]:
     return clips
 
 
-def waiting(candidates: list[Candidate], shas: dict[str, str], clips: dict[str, Candidate]) -> dict[str, str]:
-    """Readable candidates that wait for one that could not be read, by its path: a photo and its clip are one
-    item and an edit links to its original, so a later run imports each pair together."""
-    paths = {c.source_path for c in candidates}
-    needs = ([(clip.source_path, photo) for photo, clip in clips.items()]
-             + [(photo, clip.source_path) for photo, clip in clips.items()]
-             + [(c.source_path, c.edit_of) for c in candidates if c.edit_of])
-    root = {p: p for p in paths if p not in shas}
-    grew = True
-    while grew:
-        grew = False
-        for a, b in needs:
-            if a in paths and a not in root and b in root:
-                root[a], grew = root[b], True
-    return {a: r for a, r in root.items() if a != r}
+def _unread(candidates: list[Candidate], unread: dict[str, str], shas: dict[str, str],
+            clips: dict[str, Candidate]) -> list[dict]:
+    """The files that could not be read, saying what became of a readable partner: it is imported alone."""
+    photo_of = {clip.source_path: photo for photo, clip in clips.items()}
+    edited = {c.edit_of for c in candidates if c.edit_of and c.source_path in shas}
+    out = []
+    for c in candidates:
+        if c.source_path not in unread:
+            continue
+        reason = unread[c.source_path]
+        if photo_of.get(c.source_path) in shas:
+            reason += "; photo imported without it"
+        elif c.source_path in edited:
+            reason += "; its edit imported without the link"
+        out.append(problem(c, reason))
+    return out
 
 
 def _version_of(state: State, fp: tuple | None) -> str | None:
@@ -96,13 +133,17 @@ def _version_of(state: State, fp: tuple | None) -> str | None:
 
 
 def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: dict[str, dict],
-         import_of: dict[str, str], clips: dict[str, Candidate],
+         import_of: dict[str, str], clips: dict[str, Candidate], unread: dict[str, str],
          problems: list[dict]) -> tuple[list[Planned], dict[str, str]]:
-    """The items the import adds or refers to again, in source order, and each candidate's outcome. shas, exif and
-    import_of (the import id that records it) are by source path, for every candidate whose fate is settled now."""
+    """The items the import adds or records another source of, in source order, and each candidate's outcome.
+
+    shas, exif and import_of (the import id that records it) are by source path, for every candidate read;
+    unread holds why each of the others could not be.
+    """
+    problems += _unread(candidates, unread, shas, clips)
     attached = {c.source_path for c in clips.values()}
-    photos = [c for c in candidates if c.source_path in shas and c.source_path not in attached]
-    meta = {c.source_path: derive(exif.get(c.source_path, {}), c.provider, c.name, c.mtime) for c in photos}
+    meta = {c.source_path: derive(exif.get(c.source_path, {}), c.provider, c.name, c.mtime)
+            for c in candidates if c.source_path in shas}
     live_files = {f["sha256"] for i in state.items.values() if i.status == "live" for f in i.files}
     gone = {f["sha256"] for i in state.items.values() if i.blocked for f in i.files}
 
@@ -112,96 +153,115 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
         return known.blocked if known else sha in gone or state.is_blocked(sha, fp)
 
     # Decided once per SHA-256: one copy's fingerprint can match a deleted photo while another copy has no date.
-    deleted = {shas[p] for p, m in meta.items() if blocked(shas[p], fingerprint(m))}
+    deleted = {shas[p] for p, m in meta.items() if p not in attached and blocked(shas[p], fingerprint(m))}
     items: dict[str, Planned] = {}
-    settled: set[str] = set()  # held already with nothing to log: recorded by this import, or not a main file
+    met: set[str] = set()  # SHA-256 of every copy taken so far
+    recorded: set[tuple[str, str]] = set()  # (SHA-256, import id) whose source and marks the log holds already
     first_with: dict[tuple, str] = {}  # fingerprint -> the first item this import adds with it
+    alone: list[Candidate] = []  # clips that no item can take: kept as items of their own
     outcome: dict[str, str] = {}
 
-    def by_own_bytes(clip: tuple[Candidate, str], it: Planned | None, verdict: str) -> None:
-        """A clip of a photo that adds no new item counts by its own bytes, which the library must hold already."""
-        if clip[1] in live_files or it is not None and it.clip is not None and it.clip[1] == clip[1]:
+    def held_clip(clip: tuple[Candidate, str], live: str | None, verdict: str) -> None:
+        """The clip of a photo whose item exists already counts by its own bytes. An item without a clip cannot
+        take one later, so the clip becomes an item of its own; one with another clip keeps that one."""
+        if clip[1] in live_files or clip[1] == live:
             outcome[clip[0].source_path] = verdict
+        elif live is None:
+            alone.append(clip[0])
         else:
             outcome[clip[0].source_path] = "problem"
             problems.append(problem(clip[0], "clip not in library"))
 
-    for c in photos:
-        sha, found = shas[c.source_path], clips.get(c.source_path)
-        clip = (found, shas[found.source_path]) if found and found.source_path in shas else None
-        if sha in deleted:
+    def take(c: Candidate, clip: tuple[Candidate, str] | None, own_clip: bool = False) -> None:
+        sha, import_id, m = shas[c.source_path], import_of[c.source_path], meta[c.source_path]
+        fp = fingerprint(m)
+        if sha in deleted or blocked(sha, fp):
             outcome.update(dict.fromkeys([c.source_path, *([clip[0].source_path] if clip else [])], "skipped_deleted"))
-            continue
+            return
         if clip and blocked(clip[1]):
             outcome[clip[0].source_path] = "skipped_deleted"
             clip = None
-        it = items.get(sha)
-        if it or sha in settled:
-            outcome[c.source_path] = "duplicates_in_source"
-            if it:
-                it.albums.update(c.albums)
-                it.favorite, it.trashed = it.favorite or c.favorite, it.trashed and c.trashed
-            if clip and it and not it.known and it.clip is None:  # a clip only this copy has is not lost
-                it.clip, outcome[clip[0].source_path] = clip, "live_clips"
-            elif clip:
-                by_own_bytes(clip, it, "duplicates_in_source")
-            continue
         known = state.items[sha] if sha in state.items and state.items[sha].status == "live" else None
-        if known and import_of[c.source_path] in known.imports or not known and sha in live_files:
-            settled.add(sha)
-            outcome[c.source_path] = "already_in_library"
-            if clip:
-                by_own_bytes(clip, None, "already_in_library")
-            continue
-        m, fp = meta[c.source_path], fingerprint(meta[c.source_path])
-        it = items[sha] = Planned(c, sha, import_of[c.source_path], folder_of(m["taken"]), list(fp) if fp else None,
-                                known, set(c.albums), c.favorite, c.trashed and not known)
-        if known:
-            outcome[c.source_path] = "already_in_library"
-            if clip:
-                if clip[1] in {f["sha256"] for f in known.files if f["role"] == "live"}:
-                    it.clip = clip
-                by_own_bytes(clip, it, "already_in_library")
-            continue
-        outcome[c.source_path] = "imported"
-        it.version_of = _version_of(state, fp) or (first_with.get(fp) if fp else None)
-        if fp:
-            first_with.setdefault(fp, sha)
-        if clip:
-            it.clip, outcome[clip[0].source_path] = clip, "live_clips"
-    _link_edits(state, items, shas, problems)
+        it, first = items.get(sha), sha not in met
+        met.add(sha)
+        verdict = ("already_in_library" if known or sha in live_files else "imported") if first \
+            else "duplicates_in_source"
+        outcome[c.source_path] = verdict
+        key = (sha, import_id)
+        if key in recorded or known and import_id in known.imports or not known and not it and sha in live_files:
+            recorded.add(key)  # this import's record of the bytes is in the log, or there is no item to record
+        else:
+            if it is None:
+                it = items[sha] = Planned(sha, known, trashed=c.trashed and not known)
+                if own_clip and not known:
+                    problems.append(problem(c, "clip kept as its own item"))
+                if not known:
+                    it.version_of = _version_of(state, fp) or (first_with.get(fp) if fp else None)
+                    if fp:
+                        first_with.setdefault(fp, sha)
+            if key not in {(sha, s.import_id) for s in it.sources}:
+                it.sources.append(Source(c, import_id, folder_of(m["taken"]), list(fp) if fp else None))
+            it.albums.update(c.albums)
+            it.favorite, it.trashed = it.favorite or c.favorite, it.trashed and c.trashed
+        if clip is None:
+            return
+        if it and not it.known:  # an item this import adds: a clip only one copy has is not lost
+            if it.clip is None:
+                it.clip, outcome[clip[0].source_path] = clip, "live_clips"
+            elif it.clip[1] == clip[1]:
+                outcome[clip[0].source_path] = "duplicates_in_source"
+            else:
+                outcome[clip[0].source_path] = "problem"
+                problems.append(problem(clip[0], "clip not in library"))
+        else:
+            live = next((f["sha256"] for f in known.files if f["role"] == "live"), None) if known else None
+            held_clip(clip, live, verdict)
+
+    for c in candidates:
+        found = clips.get(c.source_path)
+        if c.source_path in shas and c.source_path not in attached:
+            take(c, (found, shas[found.source_path]) if found and found.source_path in shas else None)
+        elif found and found.source_path in shas and c.source_path not in shas:  # the photo could not be read
+            alone.append(found)
+    for clip in alone:
+        take(clip, None, own_clip=True)
+    _link_edits(state, items, shas, unread, problems)
     return list(items.values()), outcome
 
 
-def _link_edits(state: State, items: dict[str, Planned], shas: dict[str, str], problems: list[dict]) -> None:
+def _link_edits(state: State, items: dict[str, Planned], shas: dict[str, str], unread: dict[str, str],
+                problems: list[dict]) -> None:
     """A new item that is an edit links to its original's item, when this import has it or the library holds it."""
     for it in items.values():
         original = it.main.edit_of
         target = shas.get(original) if original else None
-        if it.known or original is None or target == it.sha:
-            continue
+        if it.known or original is None or original in unread or target == it.sha:
+            continue  # an unreadable original is listed with its edit's fate
         if target and (target in items or target in state.items and state.items[target].status == "live"):
             it.edit_of = target
         else:
             problems.append(problem(it.main, f"its original {original} was not imported: kept without the link"))
 
 
-def events_of(lib: Library, items: list[Planned], adapter: str, start: datetime) -> list[dict]:
+def events_of(lib: Library, items: list[Planned], adapter: str, start: datetime, touched: Touched) -> list[dict]:
     """Every import first, then the marks: a trash folded before a later import of the same fingerprint would
-    make fold ignore that import. A known item gets only the albums and favorite it lacks, never a trash. Each
-    event a microsecond after the last keeps their order."""
+    make fold ignore that import. An item the library holds gets only marks the log never set or cleared on it,
+    and never a trash. Each event a microsecond after the last keeps their order."""
     plain: list[tuple[str, dict]] = []
     for it in items:
-        files = [{"role": role, "name": c.name, "sha256": sha, "size": c.size, "mtime": c.mtime}
-                 for role, c, sha in it.files()]
-        links = {k: v for k, v in (("version_of", it.version_of), ("edit_of", it.edit_of)) if v}
-        plain.append(("import", {"item": it.sha, "import": it.import_id, "folder": it.folder, "files": files,
-                                 "fingerprint": it.fingerprint, **links}))
+        for n, s in enumerate(it.sources):
+            creates = n == 0 and not it.known
+            files = [{"role": role, "name": c.name, "sha256": sha, "size": c.size, "mtime": c.mtime}
+                     for role, c, sha in (it.files() if creates else [("main", s.copy, it.sha)])]
+            links = {k: v for k, v in (("version_of", it.version_of), ("edit_of", it.edit_of)) if v and creates}
+            plain.append(("import", {"item": it.sha, "import": s.import_id, "folder": s.folder, "files": files,
+                                     "fingerprint": s.fingerprint, **links}))
     for it in items:
-        have = it.known.albums if it.known else set()
-        plain += [("album.add", {"item": it.sha, "kind": "album", "album": title})
-                  for title in sorted(it.albums) if ("album", title) not in have]
-        plain += [("favorite", {"item": it.sha})] if it.favorite and not (it.known and it.known.favorite) else []
+        albums = sorted(t for t in it.albums if not it.known or ("album", t) not in it.known.albums
+                        and not touched.album(it.sha, t))
+        plain += [("album.add", {"item": it.sha, "kind": "album", "album": title}) for title in albums]
+        if it.favorite and not (it.known and it.sha in touched.favorite):
+            plain.append(("favorite", {"item": it.sha}))
         plain += [("trash", {"item": it.sha, "reason": f"Trashed in {adapter}"})] if it.trashed else []
     return [events.new_event(lib, op, ts=events.ts_str(start + timedelta(microseconds=k)), **fields)
             for k, (op, fields) in enumerate(plain)]

@@ -20,7 +20,7 @@ from pathlib import Path, PurePosixPath, PureWindowsPath
 from photokeep import __version__, events, fsops
 from photokeep.cache import Cache, regular
 from photokeep.hashcache import HashCache
-from photokeep.importplan import Candidate, Planned, SourceFile, clips_of, events_of, plan, problem, summary, waiting
+from photokeep.importplan import Candidate, Planned, SourceFile, Touched, clips_of, events_of, plan, summary
 from photokeep.library import Library, locked
 from photokeep.paths import assign
 from photokeep.progress import Say, ticking
@@ -112,10 +112,9 @@ def _earlier(lib: Library, adapter: str, candidates: list[Candidate],
     return batches, rest
 
 
-def _stage_rest(stage: Stage, rest: list[Candidate], clips: dict[str, Candidate], tool: str,
-                problems: list[dict], say: Say) -> _Batch:
-    """Stage what no earlier run recorded and read its EXIF. A file that cannot be read, and any that waits for
-    it, is a problem this batch leaves out, for a later run to import."""
+def _stage_rest(stage: Stage, rest: list[Candidate], tool: str, unread: dict[str, str], say: Say) -> _Batch:
+    """Stage what no earlier run recorded and read its EXIF. A file that cannot be read goes in unread, with why:
+    this batch leaves it out, for a later run to import."""
     shas = {}
     for c in ticking(rest, len(rest), say, "staging"):
         sha = stage.intact(c.source_path, c.size)
@@ -123,19 +122,16 @@ def _stage_rest(stage: Stage, rest: list[Candidate], clips: dict[str, Candidate]
             try:
                 sha, size = stage.put(c.source_path, c.read, c.mtime)
             except _UNREADABLE as e:
-                problems.append(problem(c, f"could not be read: {_why(e)}"))
+                unread[c.source_path] = f"could not be read: {_why(e)}"
                 continue
             if size != c.size:
-                problems.append(problem(c, f"{size} bytes read, {c.size} listed"))
+                unread[c.source_path] = f"{size} bytes read, {c.size} listed"
                 continue
         shas[c.source_path] = sha
-    waits = waiting(rest, shas, clips)
-    problems += [problem(c, f"waits for {waits[c.source_path]}, which could not be read")
-                 for c in rest if c.source_path in waits]
-    final = [c for c in rest if c.source_path in shas and c.source_path not in waits]
+    read = [c for c in rest if c.source_path in shas]
     say("reading EXIF with exiftool")
-    raw, exif = stage.exif(tool, [c.source_path for c in final])
-    return _Batch(stage, final, {c.source_path: shas[c.source_path] for c in final}, raw, exif)
+    raw, exif = stage.exif(tool, [c.source_path for c in read])
+    return _Batch(stage, read, shas, raw, exif)
 
 
 _Job = tuple[Candidate, str, str, Stage]  # candidate, SHA-256, library path, its staging
@@ -218,18 +214,20 @@ def run(lib: Library, adapter: str, candidates: list[Candidate], sources: list[S
 
     with locked(lib):
         try:
-            state = fold(events.read_all(lib))
+            log = events.read_all(lib)
+            state = fold(log)
             problems: list[dict] = []
+            unread: dict[str, str] = {}
             batches, rest = _earlier(lib, adapter, candidates, open_stage)
-            current = _stage_rest(open_stage(staged_id(lib, adapter, _tag(rest), now)), rest, clips, tool,
-                                  problems, say) if rest else None
+            current = _stage_rest(open_stage(staged_id(lib, adapter, _tag(rest), now)), rest, tool, unread,
+                                  say) if rest else None
             batches += [current] if current else []
             shas = {p: sha for b in batches for p, sha in b.shas.items()}
             exif = {p: record for b in batches for p, record in b.exif.items()}
             import_of = {c.source_path: b.stage.id for b in batches for c in b.candidates}
-            items, outcome = plan(state, candidates, shas, exif, import_of, clips, problems)
-            logged = events_of(lib, items, adapter, now)
-            after = fold(events.ordered([*events.read_all(lib), *logged]))
+            items, outcome = plan(state, candidates, shas, exif, import_of, clips, unread, problems)
+            logged = events_of(lib, items, adapter, now, Touched.of(log))
+            after = fold(events.ordered([*log, *logged]))
             paths = assign(after)
             jobs = _jobs(lib, items, paths, {c.source_path: b.stage for b in batches for c in b.candidates})
             if not dry_run:

@@ -196,16 +196,21 @@ def test_live_clip_and_edit_are_linked_to_their_photo(lib):
 
 
 @needs_exiftool
-@pytest.mark.parametrize("library_clip", ["the same", "none"])
+@pytest.mark.parametrize("library_clip", ["the same", "another", "none"])
 def test_clip_of_a_photo_in_the_library_counts_by_its_own_bytes(lib, library_clip):
     photo, clip = exif_jpeg(), b"live clip"
-    held(lib, photo, clip if library_clip == "the same" else None)
+    held(lib, photo, {"the same": clip, "another": b"another clip", "none": None}[library_clip])
     got = run(lib, cand("a/IMG_1.JPG", photo), cand("a/IMG_1.MOV", clip, live_of="a/IMG_1.JPG"))
     if library_clip == "the same":
         assert got == summary(already_in_library=2)
-    else:
+    elif library_clip == "another":  # the item keeps the clip it has
         assert got == summary(already_in_library=1, problems=[{"source_path": "a/IMG_1.MOV",
                                                                "reason": "clip not in library"}])
+    else:  # an item cannot take a clip later, so the clip's bytes are kept as a video of their own
+        assert got == summary(imported=1, already_in_library=1, bytes=len(clip), problems=[
+            {"source_path": "a/IMG_1.MOV", "reason": "clip kept as its own item"}])
+        assert [f["name"] for f in fold(read_all(lib)).items[sha(clip)].files] == ["IMG_1.MOV"]
+        assert verify(lib).ok
 
 
 @needs_exiftool
@@ -308,15 +313,87 @@ def test_unreadable_file_is_imported_by_a_later_run(lib):
 
 
 @needs_exiftool
-def test_photo_waits_for_its_unreadable_clip(lib):
+def test_photo_with_an_unreadable_clip_is_imported_alone(lib):
     photo, clip = exif_jpeg(), b"live clip"
     pair = [cand("a/IMG_1.JPG", photo), cand("a/IMG_1.MP4", clip, live_of="a/IMG_1.JPG")]
     got = run(lib, pair[0], dataclasses.replace(pair[1], read=unplugged))
-    assert got == summary(problems=[{"source_path": "a/IMG_1.MP4", "reason": "could not be read: source unplugged"},
-                                    {"source_path": "a/IMG_1.JPG",
-                                     "reason": "waits for a/IMG_1.MP4, which could not be read"}])
-    assert list(lib.sources.iterdir()) == [] and staged(lib) == []
-    assert run(lib, *pair) == summary(imported=1, live_clips=1, bytes=len(photo) + len(clip))
+    assert got == summary(imported=1, bytes=len(photo), problems=[
+        {"source_path": "a/IMG_1.MP4", "reason": "could not be read: source unplugged; photo imported without it"}])
+    assert [f["role"] for f in fold(read_all(lib)).items[sha(photo)].files] == ["main"]
+    # repaired later: the photo's item cannot take it any more, so the clip is kept as an item of its own
+    assert run(lib, *pair) == summary(imported=1, already_in_library=1, bytes=len(clip), problems=[
+        {"source_path": "a/IMG_1.MP4", "reason": "clip kept as its own item"}])
+    assert verify(lib).ok
+
+
+@needs_exiftool
+def test_clip_of_an_unreadable_photo_is_kept_as_its_own_item(lib):
+    photo, clip = exif_jpeg(), b"live clip"
+    got = run(lib, dataclasses.replace(cand("a/IMG_1.JPG", photo), read=unplugged),
+              cand("a/IMG_1.MP4", clip, live_of="a/IMG_1.JPG"))
+    assert got == summary(imported=1, bytes=len(clip), problems=[
+        {"source_path": "a/IMG_1.JPG", "reason": "could not be read: source unplugged"},
+        {"source_path": "a/IMG_1.MP4", "reason": "clip kept as its own item"}])
+    assert sha(clip) in fold(read_all(lib)).items
+
+
+@needs_exiftool
+def test_edit_of_an_unreadable_original_is_imported_alone(lib):
+    edit = exif_jpeg((9, 9, 9))
+    got = run(lib, dataclasses.replace(cand("a/IMG_1.JPG", exif_jpeg()), read=unplugged),
+              cand("a/IMG_1-edited.JPG", edit, edit_of="a/IMG_1.JPG"))
+    assert got == summary(imported=1, bytes=len(edit), problems=[
+        {"source_path": "a/IMG_1.JPG",
+         "reason": "could not be read: source unplugged; its edit imported without the link"}])
+    assert fold(read_all(lib)).items[sha(edit)].edit_of is None
+
+
+@needs_exiftool
+@pytest.mark.parametrize("order", ["year folder first", "album first"])
+def test_copy_read_by_a_later_run_brings_its_album(lib, order):
+    photo = exif_jpeg()
+    year, album = cand("Photos from 2024/IMG_1.JPG", photo), cand("Trip/IMG_1.JPG", photo, albums=("Trip",))
+    broken = dataclasses.replace(album, read=unplugged)
+    first, later = ([year, broken], [year, album]) if order == "year folder first" else ([broken, year], [album, year])
+    run(lib, *first)
+    got = run(lib, *later)
+    assert (got["already_in_library"] + got["duplicates_in_source"], got["album_links"]) == (2, 1)
+    assert fold(read_all(lib)).items[sha(photo)].albums == {("album", "Trip")}
+    log = read_all(lib)
+    assert run(lib, *later)["album_links"] == 0 and read_all(lib) == log
+    folders = sorted(lib.sources.iterdir())
+    paths = [[(f["source_path"], f["path"]) for f in json.loads((d / "manifest.json").read_bytes())["files"]]
+             for d in folders]
+    assert sorted(paths) == [[("Photos from 2024/IMG_1.JPG", "originals/2024/03/IMG_1.JPG")],
+                             [("Trip/IMG_1.JPG", "originals/2024/03/IMG_1.JPG")]]
+
+
+@needs_exiftool
+@pytest.mark.parametrize("owner", ["unfavorite", "album.remove", "album.rename"])
+def test_a_later_source_never_undoes_the_owners_marks(lib, owner):
+    photo, other = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9), model="Other")
+    marked = cand("Trip/IMG_1.JPG", photo, favorite=True, albums=("Trip",))
+    run(lib, marked)
+    item = sha(photo)
+    change = {"unfavorite": {"item": item}, "album.remove": {"item": item, "kind": "album", "album": "Trip"},
+              "album.rename": {"kind": "album", "album": "Trip", "to": "Trip 2024"}}[owner]
+    events.append(lib, [events.new_event(lib, owner, **change)])
+    before = fold(read_all(lib)).items[item]
+    got = run(lib, marked, cand("Trip/IMG_2.JPG", other))  # another listing, so another import id
+    after = fold(read_all(lib)).items[item]
+    assert (got["already_in_library"], got["favorites"], got["album_links"]) == (1, 0, 0)
+    assert (after.favorite, after.albums) == (before.favorite, before.albums)
+    assert len(after.imports) == 2
+
+
+@needs_exiftool
+def test_a_later_source_adds_marks_the_item_never_had(lib):
+    photo, other = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9), model="Other")
+    run(lib, cand("a/IMG_1.JPG", photo))
+    got = run(lib, cand("Trip/IMG_1.JPG", photo, favorite=True, albums=("Trip",)), cand("a/IMG_2.JPG", other))
+    assert (got["favorites"], got["album_links"]) == (1, 1)
+    item = fold(read_all(lib)).items[sha(photo)]
+    assert (item.favorite, item.albums) == (True, {("album", "Trip")})
 
 
 @needs_exiftool
