@@ -149,6 +149,15 @@ def test_second_refresh_renders_only_what_is_missing(lib):
 
 
 @needs_media
+def test_refresh_says_how_far_rendering_got_every_few_seconds(lib):
+    for n in range(3):
+        add_item(lib, jpeg_bytes((n * 80, 0, 0)), name=f"{n}.JPG")
+    said: list[str] = []
+    Cache(lib).refresh(workers=1, progress=said.append)
+    assert said == ["rendering thumbnails: 3/3"]  # three quick files: only the last line
+
+
+@needs_media
 def test_unreadable_file_is_an_error_not_a_failure(lib):
     x = add_item(lib, b"not a jpeg", name="BAD.JPG")
     cache = Cache(lib)
@@ -365,8 +374,10 @@ def test_a_renderer_crash_costs_only_its_own_file(lib, monkeypatch):
     bad = add_item(lib, jpeg_bytes((1, 2, 3)), name="CRASH.JPG")
     monkeypatch.setattr(media, "render", render_or_die)
     cache = Cache(lib)
-    assert cache.refresh(workers=2) == {"items": 4, "rendered": 3, "errors": 1, "skipped_render": 0,
-                                        "source_errors": 0}
+    said: list[str] = []
+    assert cache.refresh(workers=2, progress=said.append) == {"items": 4, "rendered": 3, "errors": 1,
+                                                              "skipped_render": 0, "source_errors": 0}
+    assert said[-1].startswith("rendering thumbnails one at a time: ")
     assert [cache.item_json(i)["th"] for i in good] == [1, 1, 1] and cache.item_json(bad)["th"] == 0
     with closing(sqlite3.connect(lib.cache / "index.sqlite")) as db:
         [(error,)] = db.execute("SELECT error FROM media WHERE id = ?", (bad,)).fetchall()

@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
-from photokeep import events, fsops, importer, importplan, staging, sync
+from photokeep import events, fsops, importer, importplan, media, staging, sync
 from photokeep.cache import Cache
 from photokeep.events import read_all
 from photokeep.importer import Candidate, ImportFailed, SourceFile
@@ -22,6 +22,7 @@ from photokeep.verify import verify
 from tests.helpers import T1, add_item, ev, exif_jpeg, files_of, imp, jpeg_bytes, put, sha, snapshot
 
 needs_exiftool = pytest.mark.skipif(shutil.which("exiftool") is None, reason="exiftool is not installed")
+needs_media = pytest.mark.skipif(not media.available()[0], reason="Pillow, numpy, heif-dec or ffmpeg missing")
 IMPORT_ID = re.compile(r"\d{4}-\d\d-\d\d-test-[0-9a-f]{6}")
 FP = ["2024-03-05T10:00:00", "Pixel 7", 8, 6]  # exif_jpeg's fingerprint
 
@@ -543,6 +544,14 @@ def test_run_cut_off_after_the_log_refreshes_the_index_next_time(lib, monkeypatc
     assert run(lib, cand("a/IMG_1.JPG", data)) == summary(already_in_library=1)
     assert [r["id"] for r in Cache(lib).items_json()] == [sha(data)]
     assert staged(lib) == []
+
+
+@needs_exiftool
+@needs_media
+def test_progress_goes_on_while_the_viewer_index_renders(lib):
+    said: list[str] = []
+    importer.run(lib, "test", [cand("a/IMG_1.JPG", exif_jpeg())], [], False, datetime.now(UTC), said.append, roots=())
+    assert said[-2:] == ["refreshing the viewer index", "rendering thumbnails: 1/1"]
 
 
 @needs_exiftool

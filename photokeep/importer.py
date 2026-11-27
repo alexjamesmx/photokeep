@@ -264,7 +264,7 @@ def run(lib: Library, adapter: str, candidates: list[Candidate], sources: list[S
                 _flush(lib, [rel for _, _, rel, _ in jobs])
                 events.append(lib, logged)
                 say("refreshing the viewer index")
-                Cache(lib).refresh(render=True)
+                Cache(lib).refresh(render=True, progress=say)
                 for stage in stages:
                     stage.remove()
         finally:

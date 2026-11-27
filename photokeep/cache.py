@@ -24,6 +24,7 @@ from photokeep.events import read_all, utcnow
 from photokeep.library import Library, LibraryError
 from photokeep.metadata import derive
 from photokeep.paths import assign, valid_id
+from photokeep.progress import Say, ticking
 from photokeep.providers import icloud, takeout
 from photokeep.state import TRASH_DAYS, Item, State, fold
 
@@ -266,7 +267,8 @@ class Cache:
                 if path.is_symlink():
                     raise LibraryError(f"{path} is a symlink; a cache folder must be a real folder")
 
-    def refresh(self, render: bool = True, workers: int | None = None) -> dict:
+    def refresh(self, render: bool = True, workers: int | None = None, progress: Say | None = None) -> dict:
+        """Rebuild every row and render what is missing; progress hears how far rendering got."""
         ok, missing = media.available()
         rendered = errors = 0
         with self._db() as db:
@@ -276,7 +278,7 @@ class Cache:
             self._prune(db, state)
             todo = self._unrendered(db, rows)
             if render and ok and todo:
-                errors = self._render(db, todo, workers)
+                errors = self._render(db, todo, workers, progress or (lambda _: None))
                 rendered = len(todo) - errors
                 # the log may have moved on meanwhile
                 rows, source_errors = _rows(self.lib, fold(read_all(self.lib)), self._import)
@@ -308,19 +310,20 @@ class Cache:
         return [r for r in rows if (r["id"] not in known or not self.thumb_path(r["id"]).exists())
                 and regular(self.lib.root / r["dir"] / r["n"])]
 
-    def _render(self, db: sqlite3.Connection, todo: list[dict], workers: int | None) -> int:
+    def _render(self, db: sqlite3.Connection, todo: list[dict], workers: int | None, say: Say) -> int:
         """Render todo in worker processes, storing each result as it arrives; return the number of errors."""
         jobs = [self._job(r) for r in todo]
         errors = done = 0
         try:
             with ProcessPoolExecutor(workers or max(1, (os.cpu_count() or 2) - 2)) as pool:
-                for job, res in zip(jobs, pool.map(media.render, *zip(*jobs, strict=True), chunksize=8), strict=True):
+                results = zip(jobs, pool.map(media.render, *zip(*jobs, strict=True), chunksize=8), strict=True)
+                for job, res in ticking(results, len(jobs), say, "rendering thumbnails"):
                     errors += _store(db, job[0], res)
                     done += 1
         except BrokenProcessPool:
             # A worker died (out of memory, a crashing decoder) and took its batch with it. The rest go one at a
             # time, so a file that kills its worker again is known and recorded instead of stopping every refresh.
-            errors += self._render_one_by_one(db, jobs[done:])
+            errors += self._render_one_by_one(db, jobs[done:], say)
         return errors
 
     def _job(self, row: dict) -> tuple:
@@ -328,11 +331,11 @@ class Cache:
         path = self.lib.root / row["dir"] / row["n"]
         return row["id"], path, "video" if row["k"] == "v" else "photo", path.suffix.lower(), row["d"], self.lib.cache
 
-    def _render_one_by_one(self, db: sqlite3.Connection, jobs: list[tuple]) -> int:
+    def _render_one_by_one(self, db: sqlite3.Connection, jobs: list[tuple], say: Say) -> int:
         errors = 0
         pool = ProcessPoolExecutor(1)
         try:
-            for job in jobs:
+            for job in ticking(jobs, len(jobs), say, "rendering thumbnails one at a time"):
                 try:
                     res = pool.submit(media.render, *job).result()
                 except BrokenProcessPool:
