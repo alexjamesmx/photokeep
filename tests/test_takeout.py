@@ -270,6 +270,34 @@ def test_sidecar_that_is_not_json_is_noted_and_kept(tmp_path):
     assert (c.provider, c.note, [s.read() for s in kept]) == ({}, "sidecar is not a JSON object", [b"{oops"])
 
 
+def test_title_that_is_not_utf8_leaves_the_file_its_name_and_the_album_its_folders(tmp_path):
+    part = zip_part(tmp_path / "t.zip", {
+        f"{Y}/IMG_1.jpg": b"x", f"{Y}/IMG_1.jpg.supplemental-metadata.json": b'{"title": "IMG_\\ud800.jpg"}',
+        f"{TRIP}/IMG_2.jpg": b"y", f"{TRIP}/metadata.json": b'{"title": "Trip \\ud800"}'})
+    by = {c.source_path: c for c in takeout.list([part])[0]}
+    assert (by[f"{Y}/IMG_1.jpg"].name, by[f"{TRIP}/IMG_2.jpg"].albums) == ("IMG_1.jpg", ("Trip",))
+
+
+def test_zip_naming_a_file_in_another_encoding_is_refused(tmp_path):
+    path = zip_part(tmp_path / "t.zip", {f"{Y}/IMG_\u00e9.jpg": b"x"})  # flagged as UTF-8, as Takeout's are
+    path.write_bytes(path.read_bytes().replace("\u00e9".encode(), b"\xff\xfe"))
+    with pytest.raises(ImportFailed, match=re.escape(f"{path} names a file in a way that is not UTF-8")):
+        takeout.list([path])
+
+
+def test_sidecar_too_large_to_read_whole_is_noted_and_not_kept(tmp_path, monkeypatch):
+    monkeypatch.setattr(takeout, "_MAX_JSON", 64)
+    small = b'{"title": "IMG_2.jpg"}'
+    part = zip_part(tmp_path / "t.zip", {
+        f"{Y}/IMG_1.jpg": b"x", f"{Y}/IMG_1.jpg.supplemental-metadata.json": sidecar("IMG_1.jpg"),
+        f"{Y}/IMG_2.jpg": b"y", f"{Y}/IMG_2.jpg.supplemental-metadata.json": small})
+    read, real = [], takeout._bytes
+    monkeypatch.setattr(takeout, "_bytes", lambda path, f: read.append(path) or real(path, f))
+    cands, kept = takeout.list([part])
+    assert [(c.provider, c.note) for c in cands] == [({}, "sidecar too large"), (provider.record(small), None)]
+    assert read == [s.path for s in kept] == [f"{Y}/IMG_2.jpg.supplemental-metadata.json"]
+
+
 def test_numbered_edited_copy_is_an_edit_of_the_numbered_original(tmp_path):
     part = zip_part(tmp_path / "t.zip", {f"{Y}/IMG.jpg": b"a", f"{Y}/IMG(1).jpg": b"b", f"{Y}/IMG-edited(1).jpg": b"c",
                                          f"{Y}/IMG.jpg.supplemental-metadata(1).json": sidecar("IMG.jpg")})

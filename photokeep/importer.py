@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import zipfile
 import zlib
 from collections.abc import Callable, Iterable
@@ -22,7 +23,7 @@ from photokeep.cache import Cache, regular
 from photokeep.hashcache import HashCache
 from photokeep.importplan import Candidate, Planned, SourceFile, Touched, clips_of, events_of, plan, summary
 from photokeep.library import Library, locked
-from photokeep.paths import assign
+from photokeep.paths import assign, utf8
 from photokeep.progress import Say, ticking
 from photokeep.sources import durable, find_folder, read_folder, write_folder
 from photokeep.staging import ImportFailed, Stage, exiftool, staged_id
@@ -32,6 +33,7 @@ _ADAPTER = re.compile(r"[a-z0-9]+")  # the middle of an import id
 _OWN = frozenset({"exif.json", "manifest.json"})  # Photokeep's files in sources/<import id>/
 _UNREADABLE = (OSError, EOFError, zipfile.BadZipFile, zlib.error)  # a file gone, a damaged zip member
 _IN_LIBRARY = frozenset({"imported", "live_clips", "already_in_library", "duplicates_in_source"})
+_SPARE = 1 << 30  # free space staging leaves on the copy's disk: thumbnails, the log and the system need some too
 
 
 @dataclass
@@ -56,15 +58,21 @@ def _usable(path: str) -> bool:
 
 
 def _check_listing(candidates: list[Candidate], sources: list[SourceFile]) -> None:
-    # Source paths become paths on disk; an adapter reads them from third-party archives.
+    # Source paths become paths on disk; an adapter reads them from third-party archives. Paths, names and albums
+    # go into the log and manifests, which are UTF-8: one that is not would stop the run once its files were moved.
     for paths, own in (([c.source_path for c in candidates], frozenset()), ([s.path for s in sources], _OWN)):
         seen: set[str] = set()
         for path in paths:
             if not _usable(path) or path in own:
                 raise ImportFailed(f"unusable source path {path!r}")
+            if not utf8(path):
+                raise ImportFailed(f"source path {path!r} is not UTF-8: rename the file")
             if path in seen:
                 raise ImportFailed(f"{path} is listed twice")
             seen.add(path)
+    for c in candidates:
+        if not all(map(utf8, (c.name, *c.albums))):
+            raise ImportFailed(f"{c.source_path}: the name or an album the source gives it is not UTF-8")
 
 
 def _refuse_overlap(lib: Library, roots: Iterable[Path]) -> None:
@@ -112,9 +120,20 @@ def _earlier(lib: Library, adapter: str, candidates: list[Candidate],
     return batches, rest
 
 
+def _check_space(stage: Stage, rest: list[Candidate]) -> None:
+    """Staging copies every file onto the copy's disk before one is moved into place: refuse to start a run that
+    would fill it. Files a cut-off run staged whole are there already."""
+    needed = sum(c.size for c in rest if stage.staged.get(c.source_path, (None, None))[1] != c.size)
+    free = shutil.disk_usage(stage.top).free
+    if free < needed + _SPARE:
+        raise ImportFailed(f"staging in {stage.top} needs {needed / 1e9:.1f} GB and 1 GiB to spare, but only "
+                           f"{free / 1e9:.1f} GB is free")
+
+
 def _stage_rest(stage: Stage, rest: list[Candidate], tool: str, unread: dict[str, str], say: Say) -> _Batch:
     """Stage what no earlier run recorded and read its EXIF. A file that cannot be read goes in unread, with why:
     this batch leaves it out, for a later run to import."""
+    _check_space(stage, rest)
     shas = {}
     for c in ticking(rest, len(rest), say, "staging"):
         sha = stage.intact(c.source_path, c.size)
@@ -163,7 +182,11 @@ def _place(lib: Library, jobs: list[_Job], say: Say) -> None:
             dst = lib.root / rel
             if regular(dst) and hashes.sha(dst) == sha:
                 continue  # moved by a cut-off run
-            stage.place(c.source_path, c.read, c.size, c.mtime, sha, dst)
+            try:
+                stage.place(c.source_path, c.read, c.size, c.mtime, sha, dst)
+            except (EOFError, zipfile.BadZipFile, zlib.error) as e:  # staged again from a source that now fails
+                raise ImportFailed(f"{c.source_path} could not be read again ({type(e).__name__}: {e}); run the "
+                                   "import again once it reads") from None
             hashes.record(dst, sha)
 
 

@@ -22,6 +22,16 @@ def os_junk(name: str) -> bool:
     return name.casefold() in _JUNK or name.startswith("._")
 
 
+def utf8(text: str) -> bool:
+    """Whether text can be written as UTF-8. A name read from a disk in another encoding, or a JSON \\ud800
+    escape, holds a lone surrogate, which neither a log line nor a name on another file system can."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _size(text: str) -> int:
     return len(text.encode("utf-8", "surrogatepass"))
 

@@ -1,5 +1,6 @@
 """The folder adapter: any folder tree's photos and videos, dated by the files themselves."""
 import os
+import re
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -74,6 +75,18 @@ def test_an_unreadable_folder_stops_the_listing(tmp_path):
             folder.list([tmp_path / "src"])
     finally:
         locked.chmod(0o755)
+
+
+def test_name_that_is_not_utf8_is_refused_before_any_write(lib, tmp_path):
+    src = tmp_path / "pics"
+    try:
+        write(src / os.fsdecode(b"IMG_\xff.jpg"), jpeg_bytes())
+    except (OSError, UnicodeError):
+        pytest.skip("this file system takes UTF-8 names only")
+    cands, sources = folder.list([src])
+    with pytest.raises(ImportFailed, match=re.escape("source path 'pics/IMG_\\udcff.jpg' is not UTF-8")):
+        importer.run(lib, "folder", cands, sources, False, datetime.now(UTC), roots=[src])
+    assert not (lib.cache / "import").exists()
 
 
 def test_registers_no_provider_reader():

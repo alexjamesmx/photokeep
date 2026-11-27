@@ -2,11 +2,12 @@ import json
 import shutil
 import tomllib
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
 
-from photokeep import __version__
+from photokeep import __version__, fsops, staging
 from photokeep.cli import main
 from tests.helpers import jpeg_bytes
 
@@ -100,3 +101,19 @@ def test_import_refuses_what_it_cannot_read(lib, tmp_path, capsys):
 def test_import_into_something_that_is_not_a_copy(tmp_path, capsys):
     assert main(["import", "takeout", str(_takeout(tmp_path / "t.zip")), "--into", str(tmp_path)]) == 1
     assert capsys.readouterr().err.startswith("photokeep: ")
+
+
+@needs_exiftool
+@pytest.mark.parametrize("error", [zipfile.BadZipFile("Bad CRC-32 for file 'A.jpg'"),
+                                   zlib.error("Error -3 while decompressing data: invalid block type"),
+                                   EOFError("Compressed file ended before the end-of-stream marker was reached"),
+                                   fsops.HashMismatch("A.jpg: the source's bytes changed since it was planned"),
+                                   fsops.CopyError("originals/2024/03/A.jpg already exists")])
+def test_import_that_cannot_move_a_file_into_place_is_a_one_line_error(lib, tmp_path, capsys, monkeypatch, error):
+    def place(*_):
+        raise error
+
+    monkeypatch.setattr(staging.Stage, "place", place)
+    assert main(["import", "takeout", str(_takeout(tmp_path / "t.zip")), "--into", str(lib.root)]) == 1
+    last = capsys.readouterr().err.splitlines()[-1]  # progress lines come before it
+    assert last.startswith("photokeep: ") and str(error) in last

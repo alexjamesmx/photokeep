@@ -11,13 +11,14 @@ from typing import BinaryIO, cast
 
 from photokeep.adapters import Listing, files_under, live_pairs, opener
 from photokeep.importer import Candidate, ImportFailed, SourceFile
-from photokeep.paths import os_junk
+from photokeep.paths import os_junk, utf8
 from photokeep.providers.takeout import ALBUM_METADATA, GOOGLE_PHOTOS, original, pair, record
 
 _TOP = "Takeout"
 _YEAR = re.compile(r"Photos from \d{4}")  # Google's folder for a year; every other folder is an album
 _UNREADABLE = (OSError, EOFError, zipfile.BadZipFile, zlib.error)
 _CHUNK = 1 << 20
+_MAX_JSON = 16 << 20  # a JSON file is read whole; Google's sidecars are a few hundred bytes
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,8 @@ def _zip(path: Path) -> Iterator[tuple[str, _File]]:
         zf = zipfile.ZipFile(path)
     except (OSError, zipfile.BadZipFile) as e:
         raise ImportFailed(f"{path} cannot be read as a zip: {e}") from None
+    except UnicodeDecodeError:  # a name flagged as UTF-8 that is not
+        raise ImportFailed(f"{path} names a file in a way that is not UTF-8") from None
     for info in zf.infolist():
         top, _, rel = info.filename.partition("/")
         if top == _TOP and not info.is_dir():
@@ -104,15 +107,25 @@ def _album(folder: str | None, kept: dict[str, bytes]) -> str | None:
     if folder is None or _YEAR.fullmatch(folder):
         return None
     meta = kept.get(f"{GOOGLE_PHOTOS}/{folder}/{ALBUM_METADATA}")
-    return (record(meta).get("title") if meta else None) or folder
+    title = record(meta).get("title") if meta else None
+    return title if title and utf8(title) else folder
 
 
 def _name(name: str, title: str | None) -> str:
     """The title is the name the file was uploaded with, which the export may have numbered or cut: kept when it
-    names the same kind of file."""
-    if title and PurePosixPath(title).suffix.lower() == PurePosixPath(name).suffix.lower():
+    names the same kind of file and can be written."""
+    if title and utf8(title) and PurePosixPath(title).suffix.lower() == PurePosixPath(name).suffix.lower():
         return title
     return name
+
+
+def _note(side: str | None, rec: dict, kept: dict[str, bytes]) -> str | None:
+    """Why a file has no provider record, which leaves it without Google's date and place."""
+    if rec:
+        return None
+    if side is None:
+        return "no sidecar"
+    return "sidecar is not a JSON object" if side in kept else "sidecar too large"
 
 
 def _subfolder(path: str) -> str | None:
@@ -125,15 +138,16 @@ def list(sources: Sequence[Path]) -> Listing:
     """The export's media files as candidates, year folders first, and every JSON file to keep. Takeout dates its
     files by the export, so no candidate has an mtime: the sidecar has the date."""
     files = _files(sources)
-    kept = {p: _bytes(p, f) for p, f in files.items() if p.lower().endswith(".json")}
-    media = {p: f for p, f in files.items() if p not in kept}
-    sidecar_of, clips = pair(media, kept), live_pairs(media)
+    jsons = {p: f for p, f in files.items() if p.lower().endswith(".json")}
+    kept = {p: _bytes(p, f) for p, f in jsons.items() if f.size <= _MAX_JSON}
+    media = {p: f for p, f in files.items() if p not in jsons}
+    sidecar_of, clips = pair(media, jsons), live_pairs(media)
     albums = {folder: _album(folder, kept) for folder in {_subfolder(p) for p in media}}
 
     def candidate(path: str) -> Candidate:
         name = PurePosixPath(path).name
         side = sidecar_of.get(path)
-        rec = record(kept[side]) if side else {}
+        rec = record(kept[side]) if side in kept else {}
         made_from = original(path, media)  # an edited copy keeps its own name: its sidecar names the original
         album = albums[_subfolder(path)]
         return Candidate(path, media[path].read, media[path].size, None,
@@ -141,7 +155,7 @@ def list(sources: Sequence[Path]) -> Listing:
                          albums=(album,) if album else (), trashed=(rec.get("raw") or {}).get("trashed") is True,
                          favorite=bool(rec.get("favorite")), live_of=clips.get(path),
                          edit_of=made_from if made_from in media else None,
-                         note=None if rec or made_from else ("sidecar is not a JSON object" if side else "no sidecar"))
+                         note=None if made_from else _note(side, rec, kept))
 
     order = sorted(media, key=lambda p: (albums[_subfolder(p)] is not None, p))
     return [candidate(p) for p in order], [SourceFile(p, _held(d)) for p, d in sorted(kept.items())]

@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 
@@ -623,6 +624,62 @@ def test_run_cut_off_while_moving_files_is_finished_by_running_again(lib, monkey
 
 
 @needs_exiftool
+def test_source_unreadable_when_restaged_in_place_stops_the_run_naming_it(lib, monkeypatch):
+    data = exif_jpeg()
+    photo = cand("a/IMG_1.JPG", data)
+
+    def cut_off(*_):
+        raise OSError("drive unplugged")
+
+    def bad_crc() -> io.BytesIO:
+        raise zipfile.BadZipFile("Bad CRC-32 for file 'IMG_1.JPG'")
+
+    monkeypatch.setattr(staging.Stage, "place", cut_off)
+    with pytest.raises(OSError, match="drive unplugged"):
+        run(lib, photo)
+    monkeypatch.undo()
+    (folder,) = (p for p in (lib.cache / "import").iterdir() if p.is_dir())
+    (folder / "a/IMG_1.JPG").write_bytes(b"rotted")  # so it is staged again, from a source that now fails
+    with pytest.raises(ImportFailed, match=re.escape("a/IMG_1.JPG could not be read again (BadZipFile: Bad CRC-32 "
+                                                     "for file 'IMG_1.JPG'); run the import again once it reads")):
+        run(lib, dataclasses.replace(photo, read=bad_crc))
+    assert run(lib, photo)["imported"] == 1 and verify(lib).ok
+
+
+def disk_free(monkeypatch, free: int) -> None:
+    usage = shutil.disk_usage(Path.cwd())
+    monkeypatch.setattr(shutil, "disk_usage", lambda _: usage._replace(free=free))
+
+
+@needs_exiftool
+def test_too_little_free_space_for_staging_stops_the_run_before_any_write(lib, monkeypatch):
+    data = exif_jpeg()
+    before = snapshot(lib)
+    disk_free(monkeypatch, len(data) + (1 << 30) - 1)  # a GiB is left free besides what staging takes
+    with pytest.raises(ImportFailed, match=rf"^staging in {re.escape(str(lib.cache / 'import'))} needs 0\.0 GB and 1 "
+                                           r"GiB to spare, but only 1\.1 GB is free$"):
+        run(lib, cand("a/IMG_1.JPG", data))
+    assert snapshot(lib) == before
+    disk_free(monkeypatch, len(data) + (1 << 30))
+    assert run(lib, cand("a/IMG_1.JPG", data))["imported"] == 1
+
+
+@needs_exiftool
+def test_files_a_cut_off_run_staged_need_no_more_space(lib, monkeypatch):
+    cands = [cand("x/IMG_1.JPG", exif_jpeg((1, 2, 3))), cand("x/IMG_2.JPG", exif_jpeg((9, 9, 9)))]
+
+    def cut_off(*_):
+        raise OSError("power lost")
+
+    monkeypatch.setattr(staging.Stage, "exif", cut_off)
+    with pytest.raises(OSError, match="power lost"):
+        run(lib, *cands)
+    monkeypatch.undo()
+    disk_free(monkeypatch, 1 << 30)
+    assert run(lib, *cands)["imported"] == 2
+
+
+@needs_exiftool
 def test_staged_file_on_another_filesystem_is_copied_verified(lib, monkeypatch):
     real = os.replace
 
@@ -678,6 +735,17 @@ def test_source_path_leaving_its_folder_is_refused(lib, path):
         run(lib, cand(path, b"x"))
     with pytest.raises(ImportFailed, match="unusable source path"):
         run(lib, sources=(SourceFile(path, lambda: b"{}"),))
+
+
+@pytest.mark.parametrize("field", ["source path", "name", "album"])
+def test_name_that_is_not_utf8_stops_the_run_before_any_write(lib, field):
+    odd = "IMG_\udcff.JPG"  # how Python reads a name holding the byte 0xff from a disk
+    c = {"source path": cand(f"a/{odd}", b"x"), "name": dataclasses.replace(cand("a/IMG_1.JPG", b"x"), name=odd),
+         "album": cand("a/IMG_1.JPG", b"x", albums=(odd,))}[field]
+    before = snapshot(lib)
+    with pytest.raises(ImportFailed, match="is not UTF-8"):
+        run(lib, c)
+    assert snapshot(lib) == before and staged(lib) == []
 
 
 @pytest.mark.parametrize("name", ["exif.json", "manifest.json"])

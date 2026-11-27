@@ -355,7 +355,7 @@ def cmd_import(args: argparse.Namespace) -> int:
         candidates, kept = ADAPTERS[args.adapter](args.sources)
         s = importer.run(lib, args.adapter, candidates, kept, args.dry_run, datetime.now(UTC),
                          lambda line: print(line, file=sys.stderr, flush=True), roots=args.sources)
-    except (importer.ImportFailed, LibraryError, LogCorrupt, OSError) as e:
+    except (importer.ImportFailed, LibraryError, LogCorrupt, CopyError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
     except sqlite3.Error as e:
