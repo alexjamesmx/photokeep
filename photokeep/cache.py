@@ -11,7 +11,7 @@ import json
 import os
 import re
 import sqlite3
-from collections.abc import Iterable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing, contextmanager
@@ -57,6 +57,7 @@ class _Source:
 
 _UNKNOWN = _Source()
 _Sources = dict[str, dict[str, _Source]]  # import id -> sha -> _Source
+_Read = tuple[dict[str, _Source], int]  # one import's files by sha, and its unreadable metadata files
 
 
 def _str(value) -> str | None:
@@ -97,7 +98,7 @@ def _provider(folder: Path, adapter: str | None) -> dict | None:
     return records if isinstance(records, dict) else None
 
 
-def _import_sources(folder: Path) -> tuple[dict[str, _Source], int]:
+def _import_sources(folder: Path) -> _Read:
     """The import's files by sha, and how many of its metadata files could not be read."""
     manifest = _json(folder / "manifest.json", None)
     if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
@@ -115,9 +116,23 @@ def _import_sources(folder: Path) -> tuple[dict[str, _Source], int]:
     return files, errors
 
 
-def _sources(lib: Library, imports: set[str] | None = None) -> tuple[_Sources, int]:
+def _stamp(folder: Path) -> tuple[tuple[str, int, int], ...]:
+    """Every file under folder with its size and mtime: it changes whenever what _import_sources reads does."""
+    files = []
+    for parent, _, names in os.walk(folder):
+        for name in names:
+            path = os.path.join(parent, name)
+            try:
+                st = os.stat(path)
+            except OSError:  # a sync's temp file, renamed meanwhile
+                continue
+            files.append((path, st.st_size, st.st_mtime_ns))
+    return tuple(sorted(files))
+
+
+def _sources(lib: Library, load: Callable[[Path], _Read], imports: set[str] | None = None) -> tuple[_Sources, int]:
     """What sources/ says, about every import or only the named ones."""
-    found = {d.name: _import_sources(d) for d in sorted(lib.sources.iterdir())
+    found = {d.name: load(d) for d in sorted(lib.sources.iterdir())
              if d.is_dir() and not d.is_symlink() and (imports is None or d.name in imports)}
     return {i: files for i, (files, _) in found.items()}, sum(errors for _, errors in found.values())
 
@@ -150,14 +165,15 @@ def _row(item: Item, main_path: str, sources: _Sources) -> dict:
     }
 
 
-def _rows(lib: Library, state: State, only: set[str] | None = None) -> tuple[list[dict], int]:
+def _rows(lib: Library, state: State, load: Callable[[Path], _Read],
+          only: set[str] | None = None) -> tuple[list[dict], int]:
     """One row per item (or per item in `only`), and the number of source problems met (unreadable
     files, unusable metadata)."""
     paths = assign(state)  # of every item: one item's path depends on the others' names
     if only is not None:
         paths = {i: roles for i, roles in paths.items() if i in only}
     imports = None if only is None else {i for item_id in paths for i in state.items[item_id].imports}
-    sources, errors = _sources(lib, imports)
+    sources, errors = _sources(lib, load, imports)
     rows = []
     for item_id, roles in paths.items():
         if "main" not in roles:
@@ -201,13 +217,23 @@ def _days_left(trashed_at: str | None) -> int | None:
     return max(0, min(TRASH_DAYS, TRASH_DAYS - days))  # a clock ahead on another copy never shows over 30
 
 
-def _regular(path: Path) -> bool:
+def regular(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()  # a symlink's bytes are not the library's
 
 
 class Cache:
     def __init__(self, lib: Library):
         self.lib = lib
+        # import id -> (_stamp, what was read). The viewer keeps one Cache for its whole run, so an edit
+        # does not parse its import's whole exif.json (tens of MB for a library) again.
+        self._read: dict[str, tuple[tuple, _Read]] = {}
+
+    def _import(self, folder: Path) -> _Read:
+        stamp = _stamp(folder)
+        known = self._read.get(folder.name)
+        if known is None or known[0] != stamp:
+            known = self._read[folder.name] = (stamp, _import_sources(folder))
+        return known[1]
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
@@ -243,13 +269,14 @@ class Cache:
         with self._db() as db:
             self._refuse_linked_folders()
             state = fold(read_all(self.lib))
-            rows, source_errors = _rows(self.lib, state)
+            rows, source_errors = _rows(self.lib, state, self._import)
             self._prune(db, state)
             todo = self._unrendered(db, rows)
             if render and ok and todo:
                 errors = self._render(db, todo, workers)
                 rendered = len(todo) - errors
-                rows, source_errors = _rows(self.lib, fold(read_all(self.lib)))  # the log may have moved on meanwhile
+                # the log may have moved on meanwhile
+                rows, source_errors = _rows(self.lib, fold(read_all(self.lib)), self._import)
             measured = {m["id"]: m for m in db.execute("SELECT id, w, h, sharp, dhash FROM media WHERE dhash NOT NULL")}
             groups, digest = ({}, None) if "numpy" in missing else _groups(db, _candidates(rows, measured))
             self._write(db, rows, groups, digest)
@@ -268,7 +295,7 @@ class Cache:
     def _unrendered(self, db: sqlite3.Connection, rows: list[dict]) -> list[dict]:
         known = {i for (i,) in db.execute("SELECT id FROM media")}
         return [r for r in rows if (r["id"] not in known or not self.thumb_path(r["id"]).exists())
-                and _regular(self.lib.root / r["dir"] / r["n"])]
+                and regular(self.lib.root / r["dir"] / r["n"])]
 
     def _render(self, db: sqlite3.Connection, todo: list[dict], workers: int | None) -> int:
         """Render todo in worker processes, storing each result as it arrives; return the number of errors."""
@@ -334,8 +361,9 @@ class Cache:
         items, a full refresh would regroup the whole library."""
         ids = set(ids)
         state = fold(read_all(self.lib))
-        rows, _ = _rows(self.lib, state, ids)
+        rows, _ = _rows(self.lib, state, self._import, ids)
         with self._db() as db:
+            self._refuse_linked_folders()
             self._prune(db, state)
             db.execute("BEGIN IMMEDIATE")
             with db:

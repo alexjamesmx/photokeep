@@ -6,6 +6,7 @@ websites open in the same browser cannot delete photos.
 """
 import gzip
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -13,12 +14,13 @@ import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import BinaryIO
 from urllib.parse import quote
 
 from photokeep import events
-from photokeep.cache import Cache
+from photokeep.cache import Cache, regular
 from photokeep.fsops import apply_layout, inside, plan_layout, scan
-from photokeep.library import Library, LibraryError, locked
+from photokeep.library import CopyBusy, Library, locked
 from photokeep.metadata import VIDEO_EXTS
 from photokeep.paths import assign, valid_id
 from photokeep.state import State, fold
@@ -31,6 +33,9 @@ IMAGE_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
                ".gif": "image/gif", ".heic": "image/heic"}
 # QuickTime and MP4 share the ISO container; browsers only try to play it when told it is mp4.
 VIDEO_TYPE = "video/mp4"
+# What "open in another app" opens itself. Anything else may be a program planted on a copy (a .desktop,
+# .command or .bat file runs when opened), so only its folder is shown.
+OPENABLE = frozenset(IMAGE_TYPES) | VIDEO_EXTS
 ACTIONS = {"/api/trash": "trash", "/api/restore": "restore", "/api/delete": "delete", "/api/favorite": "favorite"}
 TRASH_REASON = "Deleted in Photos"
 MAX_BODY = 8 << 20
@@ -114,13 +119,14 @@ class Viewer:
                 events.append(self.lib, changes)
                 sizes = self._fold()
                 # Deleting forever frees a name, so another item can move to it.
-                moved = {i for i in before.keys() | self.paths.keys() if before.get(i) != self.paths.get(i)}
-                touched |= moved
+                touched |= {i for i in before.keys() | self.paths.keys() if before.get(i) != self.paths.get(i)}
                 # The index follows the log, so it is updated before the files: a failed move leaves it right.
                 self.cache.refresh_items(touched)
                 self.sizes = sizes
-                if moved:  # favorites move nothing, and scanning every file is most of a write's time
-                    apply_layout(self.lib, plan_layout(self.lib, self.state, scan(self.lib)))
+            # Favorites move nothing, and scanning every file is most of a write's time. Every other action
+            # lays the files out even when it logs nothing new: a retry then finishes a move that failed.
+            if action != "favorite":
+                apply_layout(self.lib, plan_layout(self.lib, self.state, scan(self.lib)))
             rows = self.cache.items_json(touched)
         return {"items": rows, "gone": sorted(touched - {r["id"] for r in rows})}
 
@@ -176,10 +182,18 @@ class Handler(BaseHTTPRequestHandler):
         self.send_bytes(json.dumps(obj, separators=(",", ":")).encode(), "application/json", status)
 
     def send_file(self, path: Path, ctype: str, download_name: str | None = None, cache: bool = False) -> None:
+        # Opened before any header goes out, so a missing or unreadable file still gets a clean answer.
         try:
-            size = path.stat().st_size
-        except FileNotFoundError:
+            f = open(path, "rb") if path.is_file() else None
+        except OSError:
+            f = None
+        if f is None:
             return self.send_json({"error": "missing file"}, 404)
+        with f:
+            self._send_open_file(f, ctype, download_name, cache)
+
+    def _send_open_file(self, f: BinaryIO, ctype: str, download_name: str | None, cache: bool) -> None:
+        size = os.fstat(f.fileno()).st_size
         start, end, status = 0, size - 1, 200
         rng = self.headers.get("Range", "")
         if rng.startswith("bytes="):
@@ -205,12 +219,14 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(download_name)}")
         self.send_header("Cache-Control", "max-age=31536000, immutable" if cache else "no-cache")
         self.end_headers()
-        with open(path, "rb") as f:
+        try:
             f.seek(start)
             left = end - start + 1
             while left > 0 and (chunk := f.read(min(1 << 20, left))):
                 self.wfile.write(chunk)
                 left -= len(chunk)
+        except OSError:  # the drive went away mid-file, or the browser did: the body stays short
+            self.close_connection = True
 
     def do_GET(self) -> None:
         self.guarded(self.get)
@@ -229,7 +245,7 @@ class Handler(BaseHTTPRequestHandler):
         except BadRequest as e:
             self.close_connection = True  # what is left of the body would be read as the next request
             self.send_json({"error": str(e)}, 400)
-        except LibraryError as e:  # the copy is busy: a sync holds its lock
+        except CopyBusy as e:  # a sync holds the copy's lock; trying again later works
             self.send_json({"error": str(e)}, 409)
         except Exception as e:  # shown to the owner in the page; the server keeps running
             self.close_connection = True
@@ -256,10 +272,13 @@ class Handler(BaseHTTPRequestHandler):
         roles = viewer.roles(item_id)
         if roles is None:
             return self.send_json({"error": "not found"}, 404)
+        thumb, preview = viewer.cache.thumb_path(item_id), viewer.cache.preview_path(item_id)
+        # cache/ is not checked like the library's files, so a symlink planted there is never followed
         if kind == "t":
-            return self.send_file(viewer.cache.thumb_path(item_id), "image/jpeg", cache=True)
-        preview = viewer.cache.preview_path(item_id)
-        if kind == "p" and preview.is_file():
+            if not regular(thumb):
+                return self.send_json({"error": "not rendered"}, 404)
+            return self.send_file(thumb, "image/jpeg", cache=True)
+        if kind == "p" and regular(preview):
             return self.send_file(preview, "image/jpeg", cache=True)
         path = viewer.file(roles.get("live" if kind == "l" else "main"))
         if path is None:
@@ -300,12 +319,15 @@ class Handler(BaseHTTPRequestHandler):
         path = viewer.file(roles["live"] if body.get("live") is True and "live" in roles else roles.get("main"))
         if path is None:
             return self.send_json({"error": "not found"}, 404)
-        _open_outside(path.parent if body.get("folder") is True else path)
+        media_file = path.suffix.lower() in OPENABLE and regular(path)
+        _open_outside(path if media_file and body.get("folder") is not True else path.parent)
         self.send_json({"ok": True})
 
 
 class ViewerServer(ThreadingHTTPServer):
     daemon_threads = True
+    # On Windows SO_REUSEADDR lets a second server take a port in use, so the next port would never be tried.
+    allow_reuse_address = sys.platform != "win32"
 
     def __init__(self, port: int, viewer: Viewer):
         super().__init__(("127.0.0.1", port), Handler)
@@ -316,9 +338,9 @@ class ViewerServer(ThreadingHTTPServer):
 def make_server(lib: Library, port: int) -> ViewerServer:
     """The viewer for lib on 127.0.0.1, at the first free port from `port` up (PORTS are tried)."""
     viewer = Viewer(lib)
-    for candidate in range(port, port + PORTS):
+    for candidate in range(port, min(port + PORTS, 65536)):
         try:
             return ViewerServer(candidate, viewer)
         except OSError:
             continue
-    raise OSError(f"no free port from {port} to {port + PORTS - 1}")
+    raise OSError(f"no free port from {port} to {min(port + PORTS, 65536) - 1}")

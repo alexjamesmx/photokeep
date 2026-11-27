@@ -221,6 +221,35 @@ def test_refresh_items_rewrites_only_the_named_rows(lib):
     assert [r["id"] for r in cache.items_json([b, "0" * 64])] == [b]
 
 
+def test_refresh_items_never_deletes_through_a_symlinked_folder(lib, tmp_path):
+    x = add_item(lib, b"photo")
+    cache = refreshed(lib)
+    outside = tmp_path / "outside"
+    (outside / x[:2]).mkdir(parents=True)
+    (outside / x[:2] / f"{x}.jpg").write_bytes(b"keep")
+    (lib.cache / "thumbs").symlink_to(outside)
+    mark(lib, "trash", x)
+    mark(lib, "purge", x, ts=T2)
+    seed_media(lib, {x: {"thumb": 1}})
+    with pytest.raises(LibraryError, match="symlink"):
+        cache.refresh_items([x])
+    assert (outside / x[:2] / f"{x}.jpg").read_bytes() == b"keep"
+
+
+def test_an_import_is_read_again_only_when_its_files_change(lib, monkeypatch):
+    a, _ = icloud_import(lib)
+    cache = refreshed(lib)
+    reads = []
+    real = cache_module._import_sources
+    monkeypatch.setattr(cache_module, "_import_sources", lambda folder: reads.append(folder.name) or real(folder))
+    cache.refresh_items([a])
+    cache.refresh(render=False)
+    assert reads == [] and cache.item_json(a)["cam"] == "Apple iPhone 15"
+    put(lib, f"sources/{IMPORT}/exif.json", b"[]")
+    cache.refresh_items([a])
+    assert reads == [IMPORT] and cache.item_json(a)["cam"] is None
+
+
 def test_thumb_and_preview_paths(lib):
     cache, x = Cache(lib), "ab" + "0" * 62
     assert cache.thumb_path(x) == lib.cache / "thumbs" / "ab" / f"{x}.jpg"

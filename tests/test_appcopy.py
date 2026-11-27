@@ -44,6 +44,15 @@ def test_launchers_start_the_copied_app(lib):
         assert os.stat(lib.root / name).st_mode & stat.S_IXUSR
 
 
+def test_launcher_in_place_of_a_symlink_is_replaced_not_written_through(lib, tmp_path):
+    target = tmp_path / "elsewhere.sh"
+    target.write_text("keep")
+    (lib.root / "Open Photos.sh").symlink_to(target)
+    install(lib)
+    assert target.read_text() == "keep" and (lib.root / "Open Photos.sh").read_text() == SH
+    assert not (lib.root / "Open Photos.sh").is_symlink() and not any(lib.root.glob(".*.tmp"))
+
+
 def test_copied_app_runs_without_installed_packages(lib):
     install(lib)
     env = {**os.environ, "PYTHONPATH": "app"}

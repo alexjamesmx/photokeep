@@ -19,6 +19,10 @@ class LibraryError(Exception):
     pass
 
 
+class CopyBusy(LibraryError):
+    """Another process (a sync, the viewer) holds the copy's lock."""
+
+
 @dataclass(frozen=True)
 class Library:
     root: Path
@@ -152,7 +156,7 @@ def locked(lib: Library) -> Iterator[None]:
         try:
             locks.flock(fd, wait=False)
         except BlockingIOError:
-            raise LibraryError(f"{lib.root} is busy (another sync or the viewer is changing files)") from None
+            raise CopyBusy(f"{lib.root} is busy (another sync or the viewer is changing files)") from None
         yield
     finally:
         os.close(fd)  # also releases the lock

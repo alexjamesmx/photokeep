@@ -55,10 +55,14 @@ def install(lib: Library) -> None:
     replace(lib, lambda new: shutil.copytree(PACKAGE, new / "photokeep", symlinks=True,
                                              ignore=shutil.ignore_patterns("__pycache__")))
     for launcher in sorted(LAUNCHERS.iterdir()):
-        target = lib.root / launcher.name
-        shutil.copyfile(launcher, target)
+        # Through a temp file: a crash never leaves half a launcher, and a symlink in its place is replaced,
+        # not written through.
+        tmp = lib.root / f".{launcher.name}.tmp"
+        tmp.unlink(missing_ok=True)
+        shutil.copyfile(launcher, tmp)
         if launcher.suffix != ".bat":
             try:
-                os.chmod(target, 0o755)
+                os.chmod(tmp, 0o755)
             except PermissionError:  # exFAT and FAT keep no modes; the mount options decide
                 pass
+        os.replace(tmp, lib.root / launcher.name)

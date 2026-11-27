@@ -130,7 +130,7 @@ def test_favorite_moves_no_files(served, monkeypatch):
     assert by_id(client.post("/api/favorite", ids=[item], value=True), item)["f"] == 1
 
 
-def test_failed_move_leaves_the_index_following_the_log(served, monkeypatch):
+def test_failed_move_is_finished_by_a_retry(served, monkeypatch):
     lib, client, item = served
 
     def unplugged(lib, plan):
@@ -140,10 +140,13 @@ def test_failed_move_leaves_the_index_following_the_log(served, monkeypatch):
     status, _, data = client.send("/api/trash", json.dumps({"ids": [item]}))
     assert status == 500 and "device disappeared" in json.loads(data)["error"]
     assert last_event(lib)["op"] == "trash" and by_id(client.get("/api/items"), item)["tr"] == 1
+    monkeypatch.undo()
+    client.post("/api/trash", ids=[item])  # nothing left to log, but the move is still owed
+    assert (lib.trash / item / "IMG_1.JPG").is_file() and [e["op"] for e in read_all(lib)].count("trash") == 1
 
 
 def test_failed_index_update_is_rebuilt_on_the_next_request(served, monkeypatch):
-    _, client, item = served
+    lib, client, item = served
 
     def broken(cache, ids):
         raise sqlite3.OperationalError("disk I/O error")
@@ -151,6 +154,9 @@ def test_failed_index_update_is_rebuilt_on_the_next_request(served, monkeypatch)
     monkeypatch.setattr(Cache, "refresh_items", broken)
     assert client.send("/api/trash", json.dumps({"ids": [item]}))[0] == 500
     assert by_id(client.get("/api/items"), item)["tr"] == 1
+    monkeypatch.undo()
+    client.post("/api/trash", ids=[item])
+    assert (lib.trash / item / "IMG_1.JPG").is_file()
 
 
 def test_post_without_token_is_403(served):
@@ -196,6 +202,15 @@ def test_write_while_the_copy_is_busy_is_409(served):
     assert status == 409 and "busy" in json.loads(data)["error"] and read_all(lib) == before
 
 
+def test_other_library_errors_are_500(served, tmp_path):
+    lib, client, _ = served
+    index = lib.cache / "index.sqlite"
+    index.unlink()
+    index.symlink_to(tmp_path / "elsewhere.sqlite")
+    status, _, data = client.request("GET", "/api/items")
+    assert status == 500 and "symlink" in json.loads(data)["error"]
+
+
 def test_media_is_served_from_the_logged_path(served, jpeg):
     _, client, item = served
     status, headers, data = client.request("GET", f"/o/{item}")
@@ -206,6 +221,49 @@ def test_media_is_served_from_the_logged_path(served, jpeg):
     assert client.request("GET", f"/p/{item}")[2] == jpeg  # no preview rendered: the original
     client.post("/api/trash", ids=[item])
     assert client.request("GET", f"/o/{item}")[2] == jpeg  # followed into the trash
+
+
+def test_ranges_past_the_end_and_from_the_end(served, jpeg):
+    _, client, item = served
+    status, headers, data = client.request("GET", f"/o/{item}", headers={"Range": f"bytes={len(jpeg)}-"})
+    assert (status, headers["Content-Range"], data) == (416, f"bytes */{len(jpeg)}", b"")
+    status, headers, data = client.request("GET", f"/o/{item}", headers={"Range": "bytes=-10"})
+    assert (status, data) == (206, jpeg[-10:])
+    assert headers["Content-Range"] == f"bytes {len(jpeg) - 10}-{len(jpeg) - 1}/{len(jpeg)}"
+
+
+def test_download_name_is_percent_encoded(served):
+    lib, client, _ = served
+    item = add_item(lib, b"cafe", name="Café ñ.JPG")
+    headers = client.request("GET", f"/o/{item}")[1]
+    assert headers["Content-Disposition"] == "attachment; filename*=UTF-8''Caf%C3%A9%20%C3%B1.JPG"
+
+
+def test_body_over_the_limit_is_400(served):
+    _, client, _ = served
+    headers = {"X-Token": client.token, "Content-Length": str(server.MAX_BODY + 1)}
+    assert client.request("POST", "/api/trash", b"{}", headers)[0] == 400
+
+
+def test_missing_or_odd_original_is_a_clean_404(served):
+    _, client, item = served
+    original = expected_original(served[0], item)
+    original.unlink()
+    assert client.request("GET", f"/o/{item}")[0] == 404
+    original.mkdir()
+    assert client.request("GET", f"/o/{item}")[0] == 404
+
+
+def test_cache_files_that_are_symlinks_are_never_followed(served, tmp_path, jpeg):
+    lib, client, item = served
+    secret = tmp_path / "secret.jpg"
+    secret.write_bytes(b"not for the browser")
+    cache = Cache(lib)
+    for path in (cache.thumb_path(item), cache.preview_path(item)):
+        path.parent.mkdir(parents=True)
+        path.symlink_to(secret)
+    assert client.request("GET", f"/t/{item}")[0] == 404
+    assert client.request("GET", f"/p/{item}")[2] == jpeg  # the original, not the link
 
 
 @pytest.mark.parametrize("path", ["/o/..%2f..%2flibrary.json", "/o/../../library.json", "/v/" + "0" * 63,
@@ -241,6 +299,29 @@ def test_open_hands_the_logged_path_to_the_system(served, monkeypatch):
     assert client.send("/api/open", json.dumps({"id": "0" * 64}))[0] == 404
 
 
+@pytest.mark.parametrize("name", ["evil.desktop", "run.bat", "Open.command", "IMG_9.JPG.sh"])
+def test_open_shows_only_the_folder_of_anything_but_photos_and_videos(served, monkeypatch, name):
+    lib, client, _ = served
+    other = add_item(lib, b"#!/bin/sh\necho planted\n", name=name)
+    opened = []
+    monkeypatch.setattr(server.subprocess, "Popen", lambda args, **kw: opened.append(args[-1]))
+    client.post("/api/open", id=other)
+    assert opened == [str(lib.originals / "2024/01")]
+
+
+def test_open_never_follows_a_symlinked_photo(served, monkeypatch):
+    lib, client, item = served
+    original = expected_original(lib, item)
+    planted = lib.originals / "2024/01/evil.desktop"
+    planted.write_bytes(original.read_bytes())
+    original.unlink()
+    original.symlink_to(planted)
+    opened = []
+    monkeypatch.setattr(server.subprocess, "Popen", lambda args, **kw: opened.append(args[-1]))
+    client.post("/api/open", id=item)
+    assert opened == [str(original.parent)]
+
+
 def test_next_port_is_tried_when_taken(lib):
     with socket.socket() as taken:
         taken.bind(("127.0.0.1", 0))
@@ -249,6 +330,28 @@ def test_next_port_is_tried_when_taken(lib):
         srv = make_server(lib, port)
         srv.server_close()
     assert port < srv.server_port < port + server.PORTS
+
+
+def test_ports_stop_at_65535(lib, monkeypatch):
+    tried = []
+
+    def taken(port, viewer):
+        if port > 65535:
+            raise OverflowError("bind(): port must be 0-65535")
+        tried.append(port)
+        raise OSError("address in use")
+
+    monkeypatch.setattr(server, "ViewerServer", taken)
+    with pytest.raises(OSError, match="65530 to 65535"):
+        make_server(lib, 65530)
+    assert tried == list(range(65530, 65536))
+
+
+@pytest.mark.parametrize("port", ["0", "65536", "http"])
+def test_cli_serve_refuses_a_bad_port(lib, port, capsys):
+    with pytest.raises(SystemExit):
+        main(["serve", str(lib.root), "--port", port, "--no-browser"])
+    assert "not a port number" in capsys.readouterr().err
 
 
 def test_cli_serve_refuses_a_folder_that_is_no_library(tmp_path, capsys):

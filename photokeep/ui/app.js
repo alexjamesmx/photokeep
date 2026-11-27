@@ -75,15 +75,17 @@ function fmtSize(b) {
   return `${v >= 100 || e === 0 ? Math.round(v) : v.toFixed(1)} ${u[e]}`;
 }
 function fmtDur(s) {
-  if (s == null) return '';
-  s = Math.round(s);
+  if (s == null || !Number.isFinite(+s)) return '';
+  s = Math.round(+s);
   const m = Math.floor(s / 60), r = s % 60;
   return m >= 60 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, '0')}:${String(r).padStart(2, '0')}` : `${m}:${String(r).padStart(2, '0')}`;
 }
-const parseLocal = t => (t ? new Date(t) : null); // "YYYY-MM-DDTHH:MM:SS" without zone is read as local wall clock
+// "YYYY-MM-DDTHH:MM:SS" without zone is read as local wall clock. Logs write microseconds, and only
+// Chromium parses more than three fraction digits.
+const parseLocal = t => (t ? new Date(t.replace(/(\.\d{3})\d+/, '$1')) : null);
 function fmtDate(t, long) {
   const d = parseLocal(t);
-  if (!d) return 'No date';
+  if (!d || Number.isNaN(d.getTime())) return 'No date';
   return d.toLocaleString(undefined, long ? { weekday: 'short', dateStyle: undefined, year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' } : { dateStyle: 'medium' });
 }
 function monthLabel(key) {
@@ -93,6 +95,7 @@ function monthLabel(key) {
 }
 const plural = (n, w) => `${nf.format(n)} ${w}${n === 1 ? '' : 's'}`;
 const daysLeft = it => (it.left == null ? null : `${plural(it.left, 'day')} left`);
+const dims = it => (it.w && it.h ? `${it.w}×${it.h}` : null);
 
 /* Video support: many iPhone clips are HEVC, which not every browser can decode. */
 const probe = document.createElement('video');
@@ -391,7 +394,7 @@ function tile(it, i, label) {
   const badges = h('div', { class: 'badges' },
     it.k === 'v' ? h('span', {}, fmtDur(it.d), icon('play')) : null,
     it.lv ? h('span', { title: 'Live Photo' }, icon('live')) : null);
-  const lab = it.tr ? daysLeft(it) : label === 'size' ? fmtSize(it.s) : label === 'dur' && it.d ? fmtDur(it.d) : label === 'mp' && it.w ? `${it.w}×${it.h}` : null;
+  const lab = it.tr ? daysLeft(it) : label === 'size' ? fmtSize(it.s) : label === 'dur' && it.d ? fmtDur(it.d) : label === 'mp' ? dims(it) : null;
   return h('div', { class: `tile${S.sel.has(it.id) ? ' sel' : ''}`, 'data-i': i, 'data-id': it.id, title: `${fmtDate(it.t, true)} · ${fmtSize(it.s)}` },
     it.th ? h('img', { src: `/t/${it.id}`, loading: 'lazy', decoding: 'async', alt: '' }) : h('div', { class: 'noimg' }, (it.n.split('.').pop() || '').toUpperCase()),
     h('button', { class: 'check', 'aria-label': 'Select', tabindex: -1 }, icon('check')),
@@ -553,10 +556,10 @@ function renderViewer() {
   const trashBtn = it.tr
     ? h('button', { class: 'iconbtn', title: 'Restore', onclick: () => act('restore', [it.id]) }, icon('restore'))
     : h('button', { class: 'iconbtn', title: 'Move to trash (Delete)', onclick: () => act('trash', [it.id]) }, icon('trash'));
-  stage.append(
+  stage.append(...[ // Element.append writes a null as the text "null"
     h('div', { class: 'vbar' },
       h('button', { class: 'iconbtn', title: 'Close (Esc)', onclick: closeViewer }, icon('close')),
-      h('div', { class: 'title' }, fmtDate(it.t, true), h('small', {}, `${it.n} · ${fmtSize(it.s)}${it.w ? ` · ${it.w}×${it.h}` : ''}`)),
+      h('div', { class: 'title' }, fmtDate(it.t, true), h('small', {}, [it.n, fmtSize(it.s), dims(it)].filter(Boolean).join(' · '))),
       it.tr ? null : favBtn,
       h('button', { class: `iconbtn${S.info ? ' active' : ''}`, title: 'Info (I)', onclick: () => { S.info = !S.info; store.set('info', S.info); renderViewer(); } }, icon('info')),
       h('a', { class: 'iconbtn', title: 'Download original', href: `/o/${it.id}`, download: it.n }, icon('download')),
@@ -564,7 +567,7 @@ function renderViewer() {
       trashBtn),
     S.viewer.i > 0 ? h('button', { class: 'nav-btn prev', title: 'Previous (←)', onclick: () => step(-1) }, icon('left')) : null,
     S.viewer.i < S.list.length - 1 ? h('button', { class: 'nav-btn next', title: 'Next (→)', onclick: () => step(1) }, icon('right')) : null,
-    h('div', { class: 'counter' }, `${nf.format(S.viewer.i + 1)} of ${nf.format(S.list.length)}`));
+    h('div', { class: 'counter' }, `${nf.format(S.viewer.i + 1)} of ${nf.format(S.list.length)}`)].filter(Boolean));
   put(box, stage, S.info ? infoPanel(it) : null);
   box.hidden = false;
   [S.list[S.viewer.i + 1], S.list[S.viewer.i - 1]].forEach(n => { if (n && n.k === 'p') new Image().src = `/p/${n.id}`; });
@@ -577,8 +580,9 @@ function fallback(it) {
 function infoPanel(it) {
   const row = (ico, t, d) => h('div', { class: 'irow' }, icon(ico), h('div', {}, h('div', { class: 't' }, t), d ? h('div', { class: 'd' }, d) : null));
   const srcNote = { exif: 'from the camera', provider: 'from the photo service (no camera date in the file)' }[it.ds] || '';
-  const mp = it.w && it.h ? `${(it.w * it.h / 1e6).toFixed(1)} MP · ${it.w}×${it.h}` : '';
-  const kind = it.k === 'v' ? `Video · ${fmtDur(it.d)}${it.c ? ` · ${it.c === 'hvc1' ? 'HEVC' : it.c === 'avc1' ? 'H.264' : it.c}` : ''}`
+  const mp = dims(it) && Number.isFinite(it.w * it.h) ? `${(it.w * it.h / 1e6).toFixed(1)} MP · ${dims(it)}` : '';
+  const codec = { hvc1: 'HEVC', avc1: 'H.264' }[it.c] || it.c;
+  const kind = it.k === 'v' ? ['Video', fmtDur(it.d), codec].filter(Boolean).join(' · ')
              : it.sc ? 'Screenshot' : it.lv ? 'Live Photo' : 'Photo';
   const tags = (list, prefix) => h('div', { class: 'tags' }, list.map(a => h('button', { onclick: () => { closeViewer(); go(prefix + a); } }, a)));
   const score = (label, val, max, fmt) => val == null ? null : h('div', { class: 'score' }, h('span', {}, label),
@@ -589,11 +593,11 @@ function infoPanel(it) {
     row('calendar', fmtDate(it.t, true), [it.z ? `UTC${it.z}` : '', srcNote].filter(Boolean).join(' · ')),
     row('file', it.n, `${fmtSize(it.s)} · ${kind}${mp ? ' · ' + mp : ''}`),
     it.cam ? row('camera', it.cam) : null,
-    it.la != null ? row('pin', `${it.la.toFixed(5)}, ${it.lo.toFixed(5)}`,
+    Number.isFinite(it.la) && Number.isFinite(it.lo) ? row('pin', `${it.la.toFixed(5)}, ${it.lo.toFixed(5)}`,
       h('a', { href: `https://www.openstreetmap.org/?mlat=${it.la}&mlon=${it.lo}#map=16/${it.la}/${it.lo}`, target: '_blank', rel: 'noreferrer' }, 'Map')) : null,
     it.al.length ? row('album', 'Albums', tags(it.al, 'album:')) : null,
     it.me.length ? row('memory', 'Memories', tags(it.me, 'mem:')) : null,
-    row('folder', it.tr ? 'In Trash' : it.dir, it.tr ? [it.r, it.ta && fmtDate(it.ta, true), daysLeft(it)].filter(Boolean).join(' · ') : `Originally ${it.o}`),
+    row('folder', it.tr ? 'In Trash' : it.dir, it.tr ? [it.r, it.ta && fmtDate(it.ta, true), daysLeft(it)].filter(Boolean).join(' · ') : it.o ? `Originally ${it.o}` : null),
     it.k === 'p' ? h('div', { class: 'irow' }, icon('chart'), h('div', { style: 'flex:1' }, h('div', { class: 't' }, 'Quality hints'),
       score('Sharpness', it.sh, 1500, v => Math.round(v)), score('Brightness', it.br, 255, v => Math.round(v)), score('Grain', it.no, 8, v => v.toFixed(1)))) : null,
     sim ? h('div', { class: 'irow' }, icon('layers'), h('div', {}, h('div', { class: 't' }, `${S.groups.get(it.g)} similar photos${it.b ? ' · this is the best' : ''}`),

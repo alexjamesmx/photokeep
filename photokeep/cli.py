@@ -213,9 +213,16 @@ def cmd_cache(args: argparse.Namespace) -> int:
     return 0
 
 
+def _port(text: str) -> int:
+    if not text.isdigit() or not 1 <= int(text) <= 65535:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a port number (1-65535)")
+    return int(text)
+
+
 def _serve_args(p: argparse.ArgumentParser) -> None:
     _copy_arg(p)
-    p.add_argument("--port", type=int, default=8765, help=f"first port to try (default 8765; {server.PORTS} are tried)")
+    p.add_argument("--port", type=_port, default=8765,
+                   help=f"first port to try (default 8765; up to {server.PORTS} are tried)")
     p.add_argument("--no-browser", action="store_true", help="only print the address; open no browser")
 
 
