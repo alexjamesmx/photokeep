@@ -1,10 +1,17 @@
 import json
 import os
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 from photokeep import events
+
+try:
+    import fcntl
+except ImportError:  # Windows: no flock, so a second writer is not stopped (best effort)
+    fcntl = None  # type: ignore[assignment]
 
 FORMAT_VERSION = 1
 SUBDIRS = ("originals", "sources", "log", "trash", "cache", "app")
@@ -108,3 +115,21 @@ def open_library(root: Path) -> Library:
         return Library(root, info["library_id"], copy["copy_id"], copy["name"])
     except KeyError as e:
         raise LibraryError(f"{root} has an incomplete library.json or copy.json (missing {e})") from None
+
+
+@contextmanager
+def locked(lib: Library) -> Iterator[None]:
+    """Hold the copy's exclusive lock for changing its files; fail at once if another process holds it."""
+    if fcntl is None:
+        yield
+        return
+    lib.cache.mkdir(exist_ok=True)  # cache/ is safe to delete, so it may be gone
+    fd = os.open(lib.cache / "lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise LibraryError(f"{lib.root} is busy (another sync or the viewer is changing files)") from None
+        yield
+    finally:
+        os.close(fd)  # also releases the lock

@@ -1,9 +1,11 @@
 import hashlib
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 
-from photokeep import events
+from photokeep import events, fsops
 from photokeep.library import Library
+from photokeep.paths import PART
 from photokeep.state import State, fold
 
 T0 = "2026-01-01T00:00:00.000000Z"
@@ -52,3 +54,51 @@ def state_with(lib: Library, data: bytes, *, name: str = "IMG_1.JPG", folder: st
         evs.append(ev("purge", item, ts=T2, copy=lib.copy_id))
     events.append(lib, evs)
     return fold(events.read_all(lib))
+
+
+def add_item(lib: Library, data: bytes, *, name: str = "IMG_1.JPG", folder: str = "2024/01", ts: str = T0) -> str:
+    """Import `data` on lib as the importer would: file under originals/ plus an import event."""
+    put(lib, f"originals/{folder}/{name}", data)
+    item = sha(data)
+    events.append(lib, [imp(item, name=name, folder=folder, ts=ts, copy=lib.copy_id)])
+    return item
+
+
+def mark(lib: Library, op: str, item: str, ts: str = T1) -> None:
+    events.append(lib, [ev(op, item, ts=ts, copy=lib.copy_id)])
+
+
+def files_of(lib: Library) -> dict[str, bytes]:
+    return {p.relative_to(lib.root).as_posix(): p.read_bytes()
+            for top in (lib.originals, lib.trash) for p in sorted(top.rglob("*")) if p.is_file()}
+
+
+def no_part_files(*libs: Library) -> bool:
+    return not any(p.name.endswith(PART) for lib in libs for p in lib.root.rglob("*"))
+
+
+def snapshot(*libs: Library) -> dict[str, bytes | None]:
+    """Every file (bytes) and folder (None) of each copy, except the rebuildable cache/."""
+    out: dict[str, bytes | None] = {}
+    for n, lib in enumerate(libs):
+        for p in sorted(lib.root.rglob("*")):
+            rel = p.relative_to(lib.root)
+            if rel.parts[0] != "cache":
+                out[f"{n}/{rel.as_posix()}"] = None if p.is_dir() else p.read_bytes()
+    return out
+
+
+def fail_after(n: int) -> Callable[[Path, Path, str], None]:
+    """A copy_verified that copies n files, then dies mid-copy like an unplugged drive."""
+    real = fsops.copy_verified
+    done: list[Path] = []
+
+    def copy(src: Path, dst: Path, digest: str) -> None:
+        if len(done) == n:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.with_name(dst.name + PART).write_bytes(src.read_bytes()[:1])
+            raise fsops.CopyError(f"{dst}: device disappeared")
+        real(src, dst, digest)
+        done.append(dst)
+
+    return copy

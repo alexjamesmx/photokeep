@@ -47,6 +47,12 @@ class HashCache:
                         (key, st.st_size, st.st_mtime_ns, digest))
         return digest
 
+    def record(self, path: Path, sha: str) -> None:
+        """Store a hash the caller has just verified, so the file is not read again to learn it."""
+        st = (self.root / path).stat()
+        self.db.execute("INSERT OR REPLACE INTO files VALUES (?, ?, ?, ?)",
+                        (self._key(path), st.st_size, st.st_mtime_ns, sha))
+
     def forget(self, path: Path) -> None:
         self.db.execute("DELETE FROM files WHERE path = ?", (self._key(path),))
 

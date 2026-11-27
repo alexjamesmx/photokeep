@@ -156,25 +156,25 @@ def _remove_empty_folders(top: Path) -> None:
             os.rmdir(folder)
 
 
+def inside(lib: Library, path: Path) -> bool:
+    """True when path, with symlinks resolved, lies under lib's originals/ or trash/."""
+    # Paths derive from other copies' logs and folders: file changes act only inside these two.
+    return any(path.resolve().is_relative_to(top.resolve()) for top in (lib.originals, lib.trash))
+
+
 def apply_layout(lib: Library, plan: LayoutPlan) -> None:
     """Carry out a plan; a step whose file changed since planning is skipped, never forced."""
-    # Plan paths derive from other copies' logs: act only inside originals/ and trash/.
-    tops = [lib.originals.resolve(), lib.trash.resolve()]
-
-    def inside(path: Path) -> bool:
-        return any(path.resolve().is_relative_to(top) for top in tops)
-
     with HashCache(lib) as cache:
         # Deletes first: a purged file may sit where a kept file has to move.
         for rel in plan.deletes:
             path, want = lib.root / rel, plan.delete_shas.get(rel)
             # The cache trusts size and mtime; re-read so a replaced file is never deleted.
-            if want and inside(path) and path.is_file() and _hash(cache, path, rehash=True) == want:
+            if want and inside(lib, path) and path.is_file() and _hash(cache, path, rehash=True) == want:
                 path.unlink(missing_ok=True)
                 cache.forget(path)
         for src, dst in plan.moves:
             source, target = lib.root / src, lib.root / dst
-            if inside(source) and inside(target) and source.is_file() and not os.path.lexists(target):
+            if inside(lib, source) and inside(lib, target) and source.is_file() and not os.path.lexists(target):
                 target.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(source, target)
                 cache.move(source, target)
