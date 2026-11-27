@@ -445,3 +445,18 @@ def test_run_whose_log_append_was_cut_off_gets_every_mark_once(lib, tmp_path, mo
     assert state.items[sha(e.media[f"{Y}/IMG_0006.jpg"])].favorite
     log = read_all(lib)
     assert run(lib)["trashed"] == 0 and read_all(lib) == log
+
+
+@needs_exiftool
+def test_original_listed_after_its_edit_is_no_version_of_it(lib, tmp_path):
+    # "-" sorts before ".", so IMG_1-edited.jpg comes first; the two share a fingerprint
+    original, edit = exif_jpeg((10, 10, 10)), exif_jpeg((200, 200, 200))
+    part = zip_part(tmp_path / "t.zip", {f"{Y}/IMG_1.jpg": original, f"{Y}/IMG_1-edited.jpg": edit,
+                                         f"{Y}/IMG_1.jpg.supplemental-metadata.json": sidecar("IMG_1.jpg")})
+    cands, sources = takeout.list([part])
+    assert [c.source_path for c in cands] == [f"{Y}/IMG_1-edited.jpg", f"{Y}/IMG_1.jpg"]
+    got = importer.run(lib, "takeout", cands, sources, False, datetime.now(UTC), roots=[part])
+    assert (got["imported"], got["versions"], got["edits"]) == (2, 0, 1)
+    state = fold(read_all(lib))
+    assert (state.items[sha(original)].version_of, state.items[sha(edit)].version_of) == (None, None)
+    assert state.items[sha(edit)].edit_of == sha(original)

@@ -229,14 +229,32 @@ def test_live_clip_and_edit_are_linked_to_their_photo(lib):
     photo, edit, clip = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9)), b"live clip"
     got = run(lib, cand("a/IMG_1-edited.JPG", edit, edit_of="a/IMG_1.JPG"),
               cand("a/IMG_1.MP4", clip, live_of="a/IMG_1.JPG"), cand("a/IMG_1.JPG", photo))
-    # one fingerprint, so the photo is also a version of the edit listed before it
-    assert got == summary(imported=2, versions=1, edits=1, live_clips=1, bytes=len(photo) + len(edit) + len(clip))
+    assert got == summary(imported=2, edits=1, live_clips=1, bytes=len(photo) + len(edit) + len(clip))
     state = fold(read_all(lib))
     assert {f["role"]: f["name"] for f in state.items[sha(photo)].files} == {"main": "IMG_1.JPG", "live": "IMG_1.MP4"}
     assert (lib.originals / "2024/03/IMG_1.MP4").read_bytes() == clip
     assert sha(clip) not in state.items
     assert state.items[sha(edit)].edit_of == sha(photo)
     assert verify(lib).ok
+
+
+@needs_exiftool
+@pytest.mark.parametrize("before", ["nothing", "the original", "the edit", "a version", "a version in the import"])
+def test_edit_and_its_original_are_never_versions_of_each_other(lib, before):
+    """They share a fingerprint, and the edit is listed first; another version of the photo still links."""
+    photo, edit, other = exif_jpeg((1, 2, 3)), exif_jpeg((9, 9, 9)), exif_jpeg((5, 5, 5))  # one fingerprint
+    pair = [cand("a/IMG_1-edited.JPG", edit, edit_of="a/IMG_1.JPG"), cand("a/IMG_1.JPG", photo)]
+    if before == "the original":
+        run(lib, pair[1])
+    elif before == "the edit":  # its original could not be read then
+        run(lib, pair[0], dataclasses.replace(pair[1], read=unplugged))
+    elif before == "a version":
+        run(lib, cand("b/IMG_5.JPG", other))
+    run(lib, *([cand("b/IMG_5.JPG", other)] if before == "a version in the import" else []), *pair)
+    state = fold(read_all(lib))
+    version = sha(other) if before.startswith("a version") else None
+    assert state.items[sha(photo)].version_of == state.items[sha(edit)].version_of == version
+    assert state.items[sha(edit)].edit_of == (None if before == "the edit" else sha(photo))
 
 
 @needs_exiftool

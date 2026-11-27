@@ -133,9 +133,23 @@ def _unread(candidates: list[Candidate], unread: dict[str, str], shas: dict[str,
     return out
 
 
-def _version_of(state: State, fp: tuple | None) -> str | None:
-    """The first live item with this fingerprint: the candidate is another version of it (spec 6.3)."""
-    live = [state.items[i] for i in state.fingerprints.get(fp, ()) if state.items[i].status == "live"] if fp else []
+def _apart(candidates: list[Candidate], shas: dict[str, str]) -> dict[str, set[str]]:
+    """The SHA-256 of each edit's original, and of each original's edits: an edit keeps its original's capture time
+    and camera, so their fingerprints match, but it is linked as an edit, never as a version."""
+    apart: dict[str, set[str]] = {}
+    for c in candidates:
+        if c.edit_of in shas and c.source_path in shas:
+            edit, original = shas[c.source_path], shas[c.edit_of]
+            apart.setdefault(edit, set()).add(original)
+            apart.setdefault(original, set()).add(edit)
+    return apart
+
+
+def _version_of(state: State, fp: tuple | None, apart: Collection[str]) -> str | None:
+    """The first live item with this fingerprint, other than those apart: the candidate is another version of it
+    (spec 6.3)."""
+    live = [state.items[i] for i in state.fingerprints.get(fp, ()) if state.items[i].status == "live"
+            and i not in apart] if fp else []
     return min(live, key=lambda i: (i.first_ts, i.id)).id if live else None
 
 
@@ -162,9 +176,10 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
     # Decided once per SHA-256: one copy's fingerprint can match a deleted photo while another copy has no date.
     deleted = {shas[p] for p, m in meta.items() if p not in attached and blocked(shas[p], fingerprint(m))}
     batches = set(import_of.values())  # this source's import ids: earlier runs' and this one's
+    apart = _apart(candidates, shas)
     items: dict[str, Planned] = {}
     met: set[str] = set()  # SHA-256 of every copy taken so far
-    first_with: dict[tuple, str] = {}  # fingerprint -> the first item this import adds with it
+    first_with: dict[tuple, str] = {}  # fingerprint -> the first item this import adds with it, edits aside
     alone: list[Candidate] = []  # clips that no item can take: kept as items of their own
     outcome: dict[str, str] = {}
 
@@ -201,8 +216,10 @@ def plan(state: State, candidates: list[Candidate], shas: dict[str, str], exif: 
                 if own_clip and not known:
                     problems.append(problem(c, "clip kept as its own item"))
                 if not known:
-                    it.version_of = _version_of(state, fp) or (first_with.get(fp) if fp else None)
-                    if fp:
+                    mine = apart.get(sha, set())
+                    earlier = first_with.get(fp) if fp else None
+                    it.version_of = _version_of(state, fp, mine) or (earlier if earlier not in mine else None)
+                    if fp and not c.edit_of:
                         first_with.setdefault(fp, sha)
             # A copy whose import the log records already brings only its marks, which events_of filters.
             if not (known and import_id in known.imports) and import_id not in {s.import_id for s in it.sources}:
