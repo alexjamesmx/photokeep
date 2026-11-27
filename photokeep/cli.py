@@ -1,5 +1,6 @@
 import argparse
 import json
+import sqlite3
 import sys
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -15,6 +16,12 @@ from photokeep.library import LibraryError, init_copy, init_library, open_librar
 COMMANDS: dict[str, Callable[[argparse.Namespace], int]] = {}
 # Optional per-command argument definitions, keyed like COMMANDS.
 ARGUMENTS: dict[str, Callable[[argparse.ArgumentParser], None]] = {}
+
+
+def _cache_db_error(e: sqlite3.Error) -> int:
+    print(f"photokeep: cache database error ({e}); cache/ holds only rebuildable data and can be deleted",
+          file=sys.stderr)
+    return 1
 
 
 def _init_args(p: argparse.ArgumentParser) -> None:
@@ -100,6 +107,8 @@ def cmd_sync(args: argparse.Namespace) -> int:
     except (LibraryError, LogCorrupt, CopyError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
+    except sqlite3.Error as e:
+        return _cache_db_error(e)
     summary = result.summary()
     print(json.dumps(summary) if args.json else _sync_text(summary, not args.yes, args.update_app))
     # Exit 2: sync finished, but the copies could not be made whole and the owner has to look.
@@ -137,6 +146,8 @@ def cmd_verify(args: argparse.Namespace) -> int:
     except (LibraryError, LogCorrupt, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
+    except sqlite3.Error as e:
+        return _cache_db_error(e)
 
 
 def _repair_args(p: argparse.ArgumentParser) -> None:
@@ -151,6 +162,8 @@ def cmd_repair(args: argparse.Namespace) -> int:
     except (LibraryError, LogCorrupt, CopyError, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
+    except sqlite3.Error as e:
+        return _cache_db_error(e)
 
 
 def cmd_status(args: argparse.Namespace) -> int:
@@ -183,6 +196,8 @@ def cmd_cache(args: argparse.Namespace) -> int:
     except (LibraryError, LogCorrupt, OSError) as e:
         print(f"photokeep: {e}", file=sys.stderr)
         return 1
+    except sqlite3.Error as e:
+        return _cache_db_error(e)
     if args.json:
         print(json.dumps(counts))
         return 0

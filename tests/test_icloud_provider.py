@@ -36,3 +36,15 @@ def test_albums_memories_and_merged_titles(tmp_path):
     assert out["part1/Photos/b.jpg"]["albums"] == ["Spring 2025"]
     assert out["part1/Photos/b.jpg"]["memories"] == ["Trip"]
     assert out["part1/Photos/a.jpg"]["memories"] == []
+
+
+def test_damaged_export_gives_what_it_can(tmp_path):
+    huge = '"' + "x" * 200_000 + '"\n'  # over csv.field_size_limit()
+    write(tmp_path / "part1/Photos/Photo Details.csv", HEADER + row("a.jpg") + "b.jpg,abc\n" + huge + row("c.jpg"))
+    write(tmp_path / "part1/Albums/Trip.csv", "Images\na.jpg\n" + huge + "c.jpg\n")
+    (tmp_path / "part2/Photos").mkdir(parents=True)
+    (tmp_path / "part2/Photos/Photo Details-1.csv").write_bytes(b"imgName\n\xff\xfe\n")
+    out = icloud.read(tmp_path)
+    assert set(out) == {"part1/Photos/a.jpg", "part1/Photos/b.jpg"}
+    assert out["part1/Photos/b.jpg"]["originalCreationDate"] is None
+    assert out["part1/Photos/a.jpg"]["albums"] == ["Trip"]

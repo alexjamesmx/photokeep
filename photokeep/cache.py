@@ -2,17 +2,21 @@
 
 Item rows are rebuilt on every refresh; the media table (what rendering measured) is kept, so only new
 items are rendered. Deleting cache/ loses nothing but the time to render again.
+
+sources/ holds third-party exports verbatim and is never edited, so anything in it that cannot be read
+is counted and skipped: a damaged export must not stop sync or the viewer for good.
 """
+import hashlib
 import json
 import os
 import re
 import sqlite3
 from collections.abc import Iterator
 from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from itertools import repeat
 from pathlib import Path, PurePosixPath
 
 from photokeep import media
@@ -39,6 +43,7 @@ CREATE TABLE IF NOT EXISTS {_ITEMS};
 _SELECT = """SELECT i.id, n, dir, k, sc, s, COALESCE(m.w, i.w) AS w, COALESCE(m.h, i.h) AS h, d, c, lc, lv, t, z,
 ds, cam, la, lo, f, hi, al, me, o, sharp AS sh, bright AS br, noise AS "no", g, b, COALESCE(thumb, 0) AS th,
 COALESCE(preview, 0) AS pv, tr, ta, r FROM items i LEFT JOIN media m ON m.id = i.id"""
+_DIED = {"error": "BrokenProcessPool: the renderer process died on this file"}
 
 
 @dataclass(frozen=True)
@@ -54,7 +59,14 @@ _UNKNOWN = _Source()
 _Sources = dict[str, dict[str, _Source]]  # import id -> sha -> _Source
 
 
-def _json(path: Path):
+def _str(value) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _json(path: Path, missing):
+    """Parsed JSON, `missing` when there is no such file, None when it cannot be read."""
+    if not path.exists():
+        return missing
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -75,31 +87,37 @@ def _adapter(manifest: dict, import_id: str) -> str | None:
     return m.group(1) if m else None
 
 
-def _provider(folder: Path, adapter: str | None) -> dict[str, dict]:
+def _provider(folder: Path, adapter: str | None) -> dict | None:
+    """The adapter's records by source path; None when its reader failed."""
     read = PROVIDERS.get(adapter) if adapter else None
     try:
-        return read(folder) if read else {}
-    except (OSError, ValueError, KeyError):  # a damaged export: the files' own metadata still shows
-        return {}
+        records = read(folder) if read else {}
+    except Exception:  # any failure on third-party content
+        return None
+    return records if isinstance(records, dict) else None
 
 
-def _import_sources(folder: Path) -> dict[str, _Source]:
-    """An unreadable manifest gives nothing: the cache never blocks sync or the viewer over a damaged import."""
-    manifest = _json(folder / "manifest.json")
+def _import_sources(folder: Path) -> tuple[dict[str, _Source], int]:
+    """The import's files by sha, and how many of its metadata files could not be read."""
+    manifest = _json(folder / "manifest.json", None)
     if not isinstance(manifest, dict) or not isinstance(manifest.get("files"), list):
-        return {}
-    records = _json(folder / "exif.json")
+        return {}, 1
+    records = _json(folder / "exif.json", [])
+    provider = _provider(folder, _adapter(manifest, folder.name))
+    errors = int(not isinstance(records, list)) + int(provider is None)
     exif = {_exif_key(str(r.get("SourceFile", "")), folder.name): r
             for r in (records if isinstance(records, list) else []) if isinstance(r, dict)}
-    provider = _provider(folder, _adapter(manifest, folder.name))
-    return {f["sha256"]: _Source(f["source_path"], f.get("mtime"), exif.get(f["source_path"], {}),
-                                 provider.get(f["source_path"]))
-            for f in manifest["files"]
-            if isinstance(f, dict) and isinstance(f.get("sha256"), str) and isinstance(f.get("source_path"), str)}
+    provider = provider or {}
+    files = {f["sha256"]: _Source(f["source_path"], _str(f.get("mtime")), exif.get(f["source_path"], {}),
+                                  provider.get(f["source_path"]))
+             for f in manifest["files"]
+             if isinstance(f, dict) and isinstance(f.get("sha256"), str) and isinstance(f.get("source_path"), str)}
+    return files, errors
 
 
-def _sources(lib: Library) -> _Sources:
-    return {d.name: _import_sources(d) for d in sorted(lib.sources.iterdir()) if d.is_dir() and not d.is_symlink()}
+def _sources(lib: Library) -> tuple[_Sources, int]:
+    found = {d.name: _import_sources(d) for d in sorted(lib.sources.iterdir()) if d.is_dir() and not d.is_symlink()}
+    return {i: files for i, (files, _) in found.items()}, sum(errors for _, errors in found.values())
 
 
 def _source(sources: _Sources, item: Item, sha: str) -> _Source:
@@ -112,14 +130,16 @@ def _row(item: Item, main_path: str, sources: _Sources) -> dict:
     main, live = files["main"], files.get("live")
     src = _source(sources, item, main["sha256"])
     clip = _source(sources, item, live["sha256"]) if live else _UNKNOWN
-    meta = derive(src.exif, src.provider, main["name"], src.mtime or main.get("mtime"))
+    meta = derive(src.exif, src.provider, main["name"], src.mtime or _str(main.get("mtime")))
     rel = PurePosixPath(main_path)
+    # exiftool -j writes numeric-looking text (a Model of "5") as a JSON number
+    cam = " ".join(str(x) for x in (meta["make"], meta["model"]) if x) or None
     return {
         "id": item.id, "n": rel.name, "dir": str(rel.parent), "k": meta["kind"][0], "sc": int(meta["screenshot"]),
-        "s": sum(f.get("size") or 0 for f in (main, live) if f), "w": meta["w"], "h": meta["h"],
-        "d": meta["duration"], "c": meta["codec"], "lc": clip.exif.get("CompressorID"), "lv": int(live is not None),
-        "t": meta["taken"], "z": meta["tz"], "ds": meta["date_src"],
-        "cam": " ".join(x for x in (meta["make"], meta["model"]) if x) or None, "la": meta["lat"], "lo": meta["lon"],
+        "s": sum(f["size"] for f in (main, live) if f and isinstance(f.get("size"), int)),
+        "w": meta["w"], "h": meta["h"], "d": meta["duration"], "c": meta["codec"],
+        "lc": clip.exif.get("CompressorID"), "lv": int(live is not None),
+        "t": meta["taken"], "z": meta["tz"], "ds": meta["date_src"], "cam": cam, "la": meta["lat"], "lo": meta["lon"],
         "f": int(item.favorite), "hi": int(item.hidden),
         "al": json.dumps(sorted(name for kind, name in item.albums if kind == "album")),
         "me": json.dumps(sorted(name for kind, name in item.albums if kind == "memory")),
@@ -128,28 +148,50 @@ def _row(item: Item, main_path: str, sources: _Sources) -> dict:
     }
 
 
-def _rows(lib: Library, state: State) -> list[dict]:
-    sources = _sources(lib)
-    return [_row(state.items[i], roles["main"], sources) for i, roles in assign(state).items() if "main" in roles]
+def _rows(lib: Library, state: State) -> tuple[list[dict], int]:
+    """One row per item, and the number of source problems met (unreadable files, unusable metadata)."""
+    sources, errors = _sources(lib)
+    rows = []
+    for item_id, roles in assign(state).items():
+        if "main" not in roles:
+            continue
+        item = state.items[item_id]
+        try:
+            rows.append(_row(item, roles["main"], sources))
+        except Exception:  # metadata of an unexpected shape: show what the log alone knows
+            rows.append(_row(item, roles["main"], {}))
+            errors += 1
+    return rows, errors
 
 
-def _groups(rows: list[dict], measured: dict[str, sqlite3.Row]) -> dict[str, tuple[str, int]]:
-    cand = [{"id": r["id"], "kind": "photo", "dhash": m["dhash"], "taken": r["t"], "screenshot": r["sc"],
-             "favorite": r["f"], "w": m["w"] or r["w"], "h": m["h"] or r["h"], "sharp": m["sharp"], "size": r["s"]}
-            for r in rows if r["k"] == "p" and not r["tr"] and not r["hi"] and (m := measured.get(r["id"]))]
-    return media.similar_groups(cand)
+def _candidates(rows: list[dict], measured: dict[str, sqlite3.Row]) -> list[dict]:
+    """similar_groups' input: live, visible photos with a dHash, by id so the same input gives the same groups."""
+    return sorted(({"id": r["id"], "kind": "photo", "dhash": m["dhash"], "taken": r["t"], "screenshot": r["sc"],
+                    "favorite": r["f"], "w": m["w"] or r["w"], "h": m["h"] or r["h"], "sharp": m["sharp"],
+                    "size": r["s"]}
+                   for r in rows if r["k"] == "p" and not r["tr"] and not r["hi"] and (m := measured.get(r["id"]))),
+                  key=lambda c: c["id"])
 
 
-def _days_left(trashed_at: str) -> int:
-    days = (datetime.now(UTC) - datetime.fromisoformat(trashed_at)) // timedelta(days=1)
+def _groups(db: sqlite3.Connection, cand: list[dict]) -> tuple[dict[str, tuple[str, int]], str]:
+    """Group similar photos, and the digest of the input. Comparing every pair takes seconds for a whole
+    library, so unchanged input reuses the groups the last refresh stored."""
+    digest = hashlib.sha256(json.dumps(cand).encode()).hexdigest()
+    stored = db.execute("SELECT value FROM meta WHERE key = 'groups_input'").fetchone()
+    if stored and stored[0] == digest:
+        return {i: (g, b) for i, g, b in db.execute("SELECT id, g, b FROM items WHERE g NOT NULL")}, digest
+    return media.similar_groups(cand), digest
+
+
+def _days_left(trashed_at: str | None) -> int | None:
+    try:
+        at = datetime.fromisoformat(trashed_at or "")
+    except ValueError:
+        return None
+    if at.tzinfo is None:  # every copy writes UTC with Z; anything else is not a time this can count from
+        return None
+    days = (datetime.now(UTC) - at) // timedelta(days=1)
     return max(0, min(TRASH_DAYS, TRASH_DAYS - days))  # a clock ahead on another copy never shows over 30
-
-
-def _item(row: sqlite3.Row) -> dict:
-    out = dict(row)
-    out["al"], out["me"] = json.loads(out["al"]), json.loads(out["me"])
-    out["left"] = _days_left(out["ta"]) if out["tr"] else None
-    return out
 
 
 def _regular(path: Path) -> bool:
@@ -194,17 +236,18 @@ class Cache:
         with self._db() as db:
             self._refuse_linked_folders()
             state = fold(read_all(self.lib))
-            rows = _rows(self.lib, state)
+            rows, source_errors = _rows(self.lib, state)
             self._prune(db, state)
             todo = self._unrendered(db, rows)
             if render and ok and todo:
                 errors = self._render(db, todo, workers)
                 rendered = len(todo) - errors
-                rows = _rows(self.lib, fold(read_all(self.lib)))  # the log may have moved on during a long render
+                rows, source_errors = _rows(self.lib, fold(read_all(self.lib)))  # the log may have moved on meanwhile
             measured = {m["id"]: m for m in db.execute("SELECT id, w, h, sharp, dhash FROM media WHERE dhash NOT NULL")}
-            self._write(db, rows, {} if "numpy" in missing else _groups(rows, measured))
+            groups, digest = ({}, None) if "numpy" in missing else _groups(db, _candidates(rows, measured))
+            self._write(db, rows, groups, digest)
         return {"items": len(rows), "rendered": rendered, "errors": errors,
-                "skipped_render": 0 if render and ok else len(todo)}
+                "skipped_render": 0 if render and ok else len(todo), "source_errors": source_errors}
 
     def _prune(self, db: sqlite3.Connection, state: State) -> None:
         """Forget what was rendered for purged items: deleted forever includes their thumbnails."""
@@ -222,18 +265,42 @@ class Cache:
 
     def _render(self, db: sqlite3.Connection, todo: list[dict], workers: int | None) -> int:
         """Render todo in worker processes, storing each result as it arrives; return the number of errors."""
-        paths = [self.lib.root / r["dir"] / r["n"] for r in todo]
-        jobs = ([r["id"] for r in todo], paths, ["video" if r["k"] == "v" else "photo" for r in todo],
-                [p.suffix.lower() for p in paths], [r["d"] for r in todo], repeat(self.lib.cache_dir()))
-        errors = 0
-        with ProcessPoolExecutor(workers or max(1, (os.cpu_count() or 2) - 2)) as pool:
-            for r, res in zip(todo, pool.map(media.render, *jobs, chunksize=8), strict=True):
-                db.execute(f"INSERT OR REPLACE INTO media (id, {', '.join(_MEDIA)}) VALUES (?{', ?' * len(_MEDIA)})",
-                           (r["id"], *(res.get(c) for c in _MEDIA)))
-                errors += "error" in res
+        jobs = [self._job(r) for r in todo]
+        errors = done = 0
+        try:
+            with ProcessPoolExecutor(workers or max(1, (os.cpu_count() or 2) - 2)) as pool:
+                for job, res in zip(jobs, pool.map(media.render, *zip(*jobs, strict=True), chunksize=8), strict=True):
+                    errors += _store(db, job[0], res)
+                    done += 1
+        except BrokenProcessPool:
+            # A worker died (out of memory, a crashing decoder) and took its batch with it. The rest go one at a
+            # time, so a file that kills its worker again is known and recorded instead of stopping every refresh.
+            errors += self._render_one_by_one(db, jobs[done:])
         return errors
 
-    def _write(self, db: sqlite3.Connection, rows: list[dict], groups: dict[str, tuple[str, int]]) -> None:
+    def _job(self, row: dict) -> tuple:
+        """media.render's arguments for one row."""
+        path = self.lib.root / row["dir"] / row["n"]
+        return row["id"], path, "video" if row["k"] == "v" else "photo", path.suffix.lower(), row["d"], self.lib.cache
+
+    def _render_one_by_one(self, db: sqlite3.Connection, jobs: list[tuple]) -> int:
+        errors = 0
+        pool = ProcessPoolExecutor(1)
+        try:
+            for job in jobs:
+                try:
+                    res = pool.submit(media.render, *job).result()
+                except BrokenProcessPool:
+                    res = _DIED
+                    pool.shutdown()
+                    pool = ProcessPoolExecutor(1)
+                errors += _store(db, job[0], res)
+        finally:
+            pool.shutdown()
+        return errors
+
+    def _write(self, db: sqlite3.Connection, rows: list[dict], groups: dict[str, tuple[str, int]],
+               digest: str | None) -> None:
         for r in rows:
             r["g"], r["b"] = groups.get(r["id"], (None, 0))
         db.execute("BEGIN IMMEDIATE")
@@ -242,13 +309,31 @@ class Cache:
             db.execute(f"CREATE TABLE {_ITEMS}")
             db.executemany(f"INSERT INTO items VALUES ({', '.join('?' * len(_COLUMNS))})",
                            ([r[c] for c in _COLUMNS] for r in rows))
-            db.execute("INSERT OR REPLACE INTO meta VALUES ('refreshed_at', ?)", (utcnow(),))
+            # the digest is stored with the groups it produced, so reusing them is always consistent
+            db.executemany("INSERT OR REPLACE INTO meta VALUES (?, ?)",
+                           [("refreshed_at", utcnow()), ("groups_input", digest)])
+
+    def _item(self, row: sqlite3.Row) -> dict:
+        out = dict(row)
+        out["al"], out["me"] = json.loads(out["al"]), json.loads(out["me"])
+        out["left"] = _days_left(out["ta"]) if out["tr"] else None
+        # a deleted cache/thumbs must not show as broken images
+        out["th"] = int(bool(out["th"]) and self.thumb_path(out["id"]).exists())
+        out["pv"] = int(bool(out["pv"]) and self.preview_path(out["id"]).exists())
+        return out
 
     def items_json(self) -> list[dict]:
         with self._db() as db:
-            return [_item(r) for r in db.execute(f"{_SELECT} ORDER BY t DESC, i.id DESC")]
+            return [self._item(r) for r in db.execute(f"{_SELECT} ORDER BY t DESC, i.id DESC")]
 
     def item_json(self, item_id: str) -> dict | None:
         with self._db() as db:
             row = db.execute(f"{_SELECT} WHERE i.id = ?", (item_id,)).fetchone()
-        return _item(row) if row else None
+        return self._item(row) if row else None
+
+
+def _store(db: sqlite3.Connection, item_id: str, res: dict) -> int:
+    """Store one render result; 1 when it is an error."""
+    db.execute(f"INSERT OR REPLACE INTO media (id, {', '.join(_MEDIA)}) VALUES (?{', ?' * len(_MEDIA)})",
+               (item_id, *(res.get(c) for c in _MEDIA)))
+    return int("error" in res)

@@ -1,11 +1,12 @@
 import hashlib
 import io
 import json
+import os
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 
-from photokeep import events, fsops
+from photokeep import events, fsops, media
 from photokeep.library import Library
 from photokeep.paths import PART
 from photokeep.state import State, fold
@@ -87,6 +88,16 @@ def add_source(lib: Library, import_id: str, files: dict[str, bytes], *, exif: l
     if dates:
         rows = "".join(f'{name},x,no,no,no,"{date}",0\n' for name, date in dates.items())
         put(lib, f"sources/{import_id}/part1/Photos/Photo Details.csv", (DETAILS_HEADER + rows).encode("utf-8-sig"))
+
+
+_real_render = media.render  # taken at import, so worker processes and patched parents both get the real one
+
+
+def render_or_die(item_id: str, path: Path, *args) -> dict:
+    """media.render, except that a file named CRASH.JPG kills its worker process the way a segfault would."""
+    if path.name == "CRASH.JPG":
+        os._exit(1)
+    return _real_render(item_id, path, *args)
 
 
 def mark(lib: Library, op: str, item: str, ts: str = T1) -> None:

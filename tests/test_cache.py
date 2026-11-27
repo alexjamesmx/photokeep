@@ -6,13 +6,14 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from photokeep import cache as cache_module
 from photokeep import events, media
 from photokeep.cache import Cache
 from photokeep.cli import main
 from photokeep.events import ts_str
 from photokeep.hashcache import HashCache
 from photokeep.library import LibraryError
-from tests.helpers import T2, add_item, add_source, ev, imp, jpeg_bytes, mark, sha
+from tests.helpers import DETAILS_HEADER, T2, add_item, add_source, ev, imp, jpeg_bytes, mark, put, render_or_die, sha
 
 IMPORT = "2026-01-05-icloud-a1b2c3"
 KEYS = {"id", "n", "dir", "k", "sc", "s", "w", "h", "d", "c", "lc", "lv", "t", "z", "ds", "cam", "la", "lo", "f",
@@ -122,7 +123,7 @@ def test_refresh_without_pillow_skips_rendering(lib, monkeypatch):
     for module in ("PIL", "numpy"):
         monkeypatch.setitem(sys.modules, module, None)  # importing them now fails
     cache = Cache(lib)
-    assert cache.refresh() == {"items": 2, "rendered": 0, "errors": 0, "skipped_render": 2}
+    assert cache.refresh() == {"items": 2, "rendered": 0, "errors": 0, "skipped_render": 2, "source_errors": 0}
     assert [i["th"] for i in cache.items_json()] == [0, 0]
     assert not (lib.cache / "thumbs").exists()
     with closing(sqlite3.connect(lib.cache / "index.sqlite")) as db:
@@ -134,11 +135,14 @@ def test_refresh_without_pillow_skips_rendering(lib, monkeypatch):
 def test_second_refresh_renders_only_what_is_missing(lib):
     x = add_item(lib, jpeg_bytes((200, 80, 40)), name="A.JPG")
     cache = Cache(lib)
-    assert cache.refresh(workers=1) == {"items": 1, "rendered": 1, "errors": 0, "skipped_render": 0}
+    assert cache.refresh(workers=1) == {"items": 1, "rendered": 1, "errors": 0, "skipped_render": 0,
+                                        "source_errors": 0}
     assert cache.thumb_path(x).is_file() and cache.item_json(x)["th"] == 1
     add_item(lib, jpeg_bytes((10, 90, 200)), name="B.JPG")
-    assert cache.refresh(workers=1) == {"items": 2, "rendered": 1, "errors": 0, "skipped_render": 0}
+    assert cache.refresh(workers=1) == {"items": 2, "rendered": 1, "errors": 0, "skipped_render": 0,
+                                        "source_errors": 0}
     cache.thumb_path(x).unlink()
+    assert cache.item_json(x)["th"] == 0  # no broken image before the next render
     assert cache.refresh(workers=1)["rendered"] == 1
     assert cache.refresh(workers=1)["rendered"] == 0
     assert (cache.item_json(x)["w"], cache.item_json(x)["sh"] is not None) == (8, True)
@@ -148,13 +152,15 @@ def test_second_refresh_renders_only_what_is_missing(lib):
 def test_unreadable_file_is_an_error_not_a_failure(lib):
     x = add_item(lib, b"not a jpeg", name="BAD.JPG")
     cache = Cache(lib)
-    assert cache.refresh(workers=1) == {"items": 1, "rendered": 0, "errors": 1, "skipped_render": 0}
+    assert cache.refresh(workers=1) == {"items": 1, "rendered": 0, "errors": 1, "skipped_render": 0,
+                                        "source_errors": 0}
     assert cache.item_json(x)["th"] == 0
 
 
 def test_render_false_counts_what_it_skipped(lib):
     icloud_import(lib)
-    assert Cache(lib).refresh(render=False) == {"items": 2, "rendered": 0, "errors": 0, "skipped_render": 2}
+    assert Cache(lib).refresh(render=False) == {"items": 2, "rendered": 0, "errors": 0, "skipped_render": 2,
+                                                "source_errors": 0}
 
 
 def test_similar_photos_are_grouped_but_hidden_ones_are_not(lib):
@@ -173,9 +179,13 @@ def test_similar_photos_are_grouped_but_hidden_ones_are_not(lib):
 def test_measured_size_wins_over_exif(lib):
     a, _ = icloud_import(lib)
     cache = refreshed(lib)
-    seed_media(lib, {a: {"w": 3024, "h": 4032, "sharp": 2.5, "thumb": 1}})  # rendered upright
+    seed_media(lib, {a: {"w": 3024, "h": 4032, "sharp": 2.5, "thumb": 1, "preview": 1}})  # rendered upright
     x = cache.item_json(a)
-    assert (x["w"], x["h"], x["sh"], x["th"]) == (3024, 4032, 2.5, 1)
+    assert (x["w"], x["h"], x["sh"], x["th"], x["pv"]) == (3024, 4032, 2.5, 0, 0)  # no files yet
+    for path in (cache.thumb_path(a), cache.preview_path(a)):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"jpeg")
+    assert (cache.item_json(a)["th"], cache.item_json(a)["pv"]) == (1, 1)
 
 
 def test_purged_item_leaves_the_index_with_its_thumbnails(lib):
@@ -238,7 +248,91 @@ def test_thumbnails_are_never_written_through_a_symlink(lib, tmp_path):
 def test_cli_cache_refresh(lib, capsys):
     icloud_import(lib)
     assert main(["cache", "refresh", str(lib.root), "--no-render", "--json"]) == 0
-    assert json.loads(capsys.readouterr().out) == {"items": 2, "rendered": 0, "errors": 0, "skipped_render": 2}
+    assert json.loads(capsys.readouterr().out) == {"items": 2, "rendered": 0, "errors": 0, "skipped_render": 2,
+                                                   "source_errors": 0}
     assert main(["cache", "refresh", str(lib.root), "--no-render"]) == 0
     assert "items: 2" in capsys.readouterr().out
     assert main(["cache", "refresh", str(lib.root / "nowhere")]) == 1
+
+
+def test_unchanged_input_reuses_the_groups(lib, monkeypatch):
+    pytest.importorskip("numpy")
+    x, y = (add_item(lib, bytes([n]), name=f"{n}.JPG") for n in range(2))
+    cache = refreshed(lib)
+    seed_media(lib, {x: {"dhash": f"{0:016x}"}, y: {"dhash": f"{0b11:016x}"}})
+    calls, real = [], media.similar_groups
+    monkeypatch.setattr(media, "similar_groups", lambda rows: calls.append(len(rows)) or real(rows))
+    cache.refresh(render=False)
+    cache.refresh(render=False)
+    assert calls == [2] and [cache.item_json(i)["g"] for i in (x, y)] == [min(x, y)] * 2
+    mark(lib, "favorite", x)
+    cache.refresh(render=False)
+    assert calls == [2, 2]
+
+
+def test_truncated_photo_details_row_does_not_stop_refresh(lib):
+    a, b = icloud_import(lib)
+    put(lib, f"sources/{IMPORT}/part1/Photos/Photo Details.csv",
+        (DETAILS_HEADER + 'IMG_1.JPG,x,no,no,no,"Monday January 1,2024 9:00 AM GMT",0\nIMG_2.JPG,x\n').encode())
+    cache = Cache(lib)
+    assert cache.refresh(render=False)["source_errors"] == 0
+    assert (cache.item_json(a)["ds"], cache.item_json(b)["ds"]) == ("exif", "mtime")
+
+
+def test_unreadable_sources_are_counted_not_fatal(lib, monkeypatch):
+    a, b = icloud_import(lib)
+    put(lib, "sources/2026-01-06-icloud-ffffff/manifest.json", b'{"files": [')
+    put(lib, f"sources/{IMPORT}/exif.json", b"[")
+
+    def damaged(folder):
+        raise RuntimeError("damaged export")
+
+    monkeypatch.setitem(cache_module.PROVIDERS, "icloud", damaged)
+    cache = Cache(lib)
+    assert cache.refresh(render=False)["source_errors"] == 3  # manifest, exif.json, provider
+    assert [(i["ds"], i["o"]) for i in cache.items_json()] == [("mtime", "part1/Photos/IMG_1.JPG"),
+                                                              ("mtime", "part1/Photos/IMG_2.JPG")]
+
+
+def test_odd_metadata_falls_back_to_what_the_log_knows(lib, monkeypatch):
+    x = add_item(lib, b"x", name="IMG_5.JPG", import_id=IMPORT)
+    add_source(lib, IMPORT, {"part1/Photos/IMG_5.JPG": b"x"},
+               exif=[{"SourceFile": "part1/Photos/IMG_5.JPG", "Make": "Apple", "Model": 5}])
+    assert refreshed(lib).item_json(x)["cam"] == "Apple 5"  # exiftool writes numeric-looking text as a number
+    real = cache_module.derive
+    monkeypatch.setattr(cache_module, "derive", lambda exif, *rest: real(exif, *rest) if not exif else 1 / 0)
+    cache = Cache(lib)
+    assert cache.refresh(render=False)["source_errors"] == 1
+    assert (cache.item_json(x)["ds"], cache.item_json(x)["o"], cache.item_json(x)["cam"]) == ("mtime", None, None)
+
+
+def test_unreadable_trash_time_shows_no_days_left(lib):
+    x, y = add_item(lib, b"x", name="X.JPG"), add_item(lib, b"y", name="Y.JPG")
+    events.append(lib, [ev("trash", x, ts="2026-01-02T00:00:00", copy=lib.copy_id),
+                        ev("trash", y, ts="2026-01-02 garbage", copy=lib.copy_id)])
+    assert [(i["tr"], i["left"]) for i in refreshed(lib).items_json()] == [(1, None), (1, None)]
+
+
+@needs_media
+def test_a_renderer_crash_costs_only_its_own_file(lib, monkeypatch):
+    good = [add_item(lib, jpeg_bytes((n * 60, 80, 40)), name=f"G{n}.JPG") for n in range(3)]
+    bad = add_item(lib, jpeg_bytes((1, 2, 3)), name="CRASH.JPG")
+    monkeypatch.setattr(media, "render", render_or_die)
+    cache = Cache(lib)
+    assert cache.refresh(workers=2) == {"items": 4, "rendered": 3, "errors": 1, "skipped_render": 0,
+                                        "source_errors": 0}
+    assert [cache.item_json(i)["th"] for i in good] == [1, 1, 1] and cache.item_json(bad)["th"] == 0
+    with closing(sqlite3.connect(lib.cache / "index.sqlite")) as db:
+        [(error,)] = db.execute("SELECT error FROM media WHERE id = ?", (bad,)).fetchall()
+    assert error.startswith("BrokenProcessPool")
+
+
+@pytest.mark.parametrize("db, argv", [("index.sqlite", ["cache", "refresh", "A"]), ("files.sqlite", ["verify", "A"]),
+                                      ("files.sqlite", ["sync", "A", "B"]),
+                                      ("files.sqlite", ["repair", "A", "--from", "B"])])
+def test_damaged_cache_database_is_a_one_line_error(a, b, capsys, db, argv):
+    add_item(a, b"photo")
+    (a.cache / db).write_bytes(b"not a database" * 100)
+    assert main([{"A": str(a.root), "B": str(b.root)}.get(arg, arg) for arg in argv]) == 1
+    err = capsys.readouterr().err
+    assert err.count("\n") == 1 and "cache/" in err and "deleted" in err

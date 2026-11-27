@@ -1,6 +1,11 @@
-"""Reads the metadata CSVs of Apple's iCloud Photos export (partN/Photos|Albums|Memories)."""
+"""Reads the metadata CSVs of Apple's iCloud Photos export (partN/Photos|Albums|Memories).
+
+The export is third-party content kept verbatim, so short rows, undecodable bytes and oversized fields
+give whatever can be read instead of an error.
+"""
 
 import csv
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime
 from pathlib import Path
 
@@ -9,11 +14,23 @@ FLAG_ALBUMS = {"Favorites", "Hidden"}
 APPLE_DATE = "%A %B %d,%Y %I:%M %p GMT"
 
 
-def _utc_iso(value: str) -> str | None:
+def _utc_iso(value: str | None) -> str | None:
     try:
-        return datetime.strptime(value.strip(), APPLE_DATE).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return datetime.strptime((value or "").strip(), APPLE_DATE).strftime("%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         return None
+
+
+def _rows(path: Path, reader: Callable[[Iterable[str]], Iterator]) -> list:
+    """The file's rows up to the first one the csv module cannot read."""
+    rows = []
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            for row in reader(fh):
+                rows.append(row)
+    except (csv.Error, UnicodeDecodeError):  # csv.Error covers fields over csv.field_size_limit()
+        pass
+    return rows
 
 
 def _read_lists(source_dir: Path, folder: str) -> dict[str, list[str]]:
@@ -29,10 +46,9 @@ def _read_lists(source_dir: Path, folder: str) -> dict[str, list[str]]:
     members: dict[str, list[str]] = {}
     for f in files:
         title = canonical(f.stem)
-        with open(f, newline="", encoding="utf-8-sig") as fh:
-            for row in list(csv.reader(fh))[1:]:
-                if row and row[0] and title not in members.setdefault(row[0], []):
-                    members[row[0]].append(title)
+        for row in _rows(f, csv.reader)[1:]:
+            if row and row[0] and title not in members.setdefault(row[0], []):
+                members[row[0]].append(title)
     return members
 
 
@@ -42,15 +58,16 @@ def read(source_dir: Path) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for f in sorted(source_dir.glob("*/Photos/Photo Details*.csv")):
         part = f.parts[-3]
-        with open(f, newline="", encoding="utf-8-sig") as fh:
-            for row in csv.DictReader(fh):
-                name = row["imgName"]
-                out[f"{part}/Photos/{name}"] = {
-                    "originalCreationDate": _utc_iso(row.get("originalCreationDate", "")),
-                    "favorite": row.get("favorite") == "yes",
-                    "hidden": row.get("hidden") == "yes",
-                    "albums": list(albums.get(name, [])),
-                    "memories": list(memories.get(name, [])),
-                    "raw": row,
-                }
+        for row in _rows(f, csv.DictReader):
+            name = row.get("imgName")  # a short row leaves its missing fields None
+            if not name:
+                continue
+            out[f"{part}/Photos/{name}"] = {
+                "originalCreationDate": _utc_iso(row.get("originalCreationDate")),
+                "favorite": row.get("favorite") == "yes",
+                "hidden": row.get("hidden") == "yes",
+                "albums": list(albums.get(name, [])),
+                "memories": list(memories.get(name, [])),
+                "raw": row,
+            }
     return out
