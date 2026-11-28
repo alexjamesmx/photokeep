@@ -1,6 +1,8 @@
 import errno
 import json
 import os
+import sqlite3
+from contextlib import closing
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -57,6 +59,97 @@ def test_sync_refreshes_both_caches(a, b):
     run(a, b, NOW)
     for lib in (a, b):
         assert sorted(i["id"] for i in Cache(lib).items_json()) == sorted([x, y])
+
+
+def rendered(lib: Library, item: str, preview: bool = False, **row) -> dict[str, bytes]:
+    """Leave a thumbnail (and preview) as a render does; return their bytes by folder."""
+    cache = Cache(lib)
+    paths = {"thumbs": cache.thumb_path(item)}
+    if preview:
+        paths["previews"] = cache.preview_path(item)
+    out = {}
+    for folder, path in paths.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(out.setdefault(folder, f"{folder} of {item[:8]} on {lib.root.name}".encode()))
+    cache.seed_media({item: {"w": 40, "h": 30, "dhash": f"{7:016x}", "thumb": 1, "preview": int(preview)} | row})
+    return out
+
+
+def media_row(lib: Library, item: str) -> dict | None:
+    with closing(sqlite3.connect(lib.cache / "index.sqlite")) as db:
+        db.row_factory = sqlite3.Row
+        row = db.execute("SELECT * FROM media WHERE id = ?", (item,)).fetchone()
+    return dict(row) if row else None
+
+
+def cache_bytes(lib: Library, item: str) -> dict[str, bytes]:
+    cache = Cache(lib)
+    paths = {"thumbs": cache.thumb_path(item), "previews": cache.preview_path(item)}
+    return {folder: path.read_bytes() for folder, path in paths.items() if path.exists()}
+
+
+def test_sync_copies_what_the_other_copy_rendered(a, b):
+    x = add_item(a, b"from a", name="A.JPG")
+    y = add_item(b, b"from b", name="B.JPG")
+    made_x, made_y = rendered(a, x, preview=True), rendered(b, y)
+    run(a, b, NOW)
+    assert cache_bytes(b, x) == made_x and cache_bytes(a, y) == made_y
+    for lib in (a, b):  # nothing left to render, and the measurements came along
+        assert Cache(lib).refresh()["rendered"] == 0
+        assert {i["id"]: (i["w"], i["h"], i["th"]) for i in Cache(lib).items_json()} == {x: (40, 30, 1), y: (40, 30, 1)}
+
+
+def test_sync_keeps_a_copys_own_render(a, b):
+    x = add_item(a, b"from a", name="A.JPG")
+    run(a, b, NOW)
+    rendered(a, x)
+    own = rendered(b, x)
+    run(a, b, NOW)
+    assert cache_bytes(b, x) == own
+
+
+def test_sync_never_copies_a_render_through_a_symlink(a, b, tmp_path):
+    x = add_item(a, b"from a", name="A.JPG")
+    rendered(a, x)
+    thumb = Cache(a).thumb_path(x)
+    (tmp_path / "outside.jpg").write_bytes(b"not the library's")
+    thumb.unlink()
+    thumb.symlink_to(tmp_path / "outside.jpg")
+    run(a, b, NOW)
+    assert cache_bytes(b, x) == {} and media_row(b, x) is None
+
+
+@pytest.mark.parametrize("row", [{"error": "decoder died"}, {"dhash": "zz"}, {"dhash": b"\x00" * 8}, {"w": "wide"},
+                                 {"h": -1}, {"sharp": "very"}, {"preview": 7}])
+def test_a_render_row_that_is_failed_or_malformed_is_not_adopted(a, b, row):
+    x = add_item(a, b"from a", name="A.JPG")
+    run(a, b, NOW)
+    rendered(a, x, **row)  # a damaged or hostile index on the other copy
+    Cache(b).adopt(Cache(a), {x})
+    assert cache_bytes(b, x) == {} and media_row(b, x) is None
+
+
+def test_sync_skips_a_row_whose_thumbnail_is_gone(a, b):
+    x = add_item(a, b"from a", name="A.JPG")
+    rendered(a, x)
+    Cache(a).thumb_path(x).unlink()
+    run(a, b, NOW)
+    assert media_row(b, x) is None
+
+
+def test_sync_takes_the_thumbnail_without_a_missing_preview(a, b):
+    x = add_item(a, b"from a", name="A.JPG")
+    made = rendered(a, x, preview=True)
+    Cache(a).preview_path(x).unlink()
+    run(a, b, NOW)
+    assert cache_bytes(b, x) == {"thumbs": made["thumbs"]} and media_row(b, x)["preview"] == 0
+
+
+def test_sync_ignores_renders_of_items_the_library_does_not_have(a, b):
+    stranger = sha(b"never imported")
+    rendered(a, stranger)
+    run(a, b, NOW)
+    assert cache_bytes(b, stranger) == {} and media_row(b, stranger) is None
 
 
 def test_trash_on_one_side_moves_file_on_the_other(a, b):

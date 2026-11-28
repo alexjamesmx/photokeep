@@ -288,10 +288,14 @@ def run(a: Library, b: Library, now: datetime, update_app: bool = False) -> Sync
         pending = plan_layout(a, state, scan(a)), plan_layout(b, state, scan(b))
         if ends:
             _replace_app(*ends)
-        # The viewer's index follows the new state; rendering new thumbnails takes minutes and waits for
-        # `photokeep cache refresh`.
-        for lib in (a, b):
-            Cache(lib).refresh(render=False)
+        # The viewer's index follows the new state. What one copy rendered is copied to the other; rendering
+        # the rest takes minutes and waits for `photokeep cache refresh`.
+        index_a, index_b = Cache(a), Cache(b)
+        known = {i for i, item in state.items.items() if item.status != "purged"}
+        index_b.adopt(index_a, known)
+        index_a.adopt(index_b, known)
+        for index in (index_a, index_b):
+            index.refresh(render=False)
     return SyncPlan(_merged(transfers), due, a_to_b, b_to_a, layout_a, layout_b, app, neither, pending,
                     to_b.bad + to_a.bad + filled[0].bad + filled[1].bad, to_b.done, to_a.done,
                     sorted(sources.conflicts + to_b.conflicts + to_a.conflicts),

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator
 from concurrent.futures import ProcessPoolExecutor
@@ -305,6 +306,27 @@ class Cache:
                 for item_id, res in measured.items():
                     _store(db, item_id, res)
 
+    def adopt(self, other: "Cache", items: set[str]) -> None:
+        """Take the thumbnails, previews and measurements other rendered for items this copy has not rendered.
+        Both copies hold the same originals, so a render is valid on either, and copying it is far faster than
+        rendering again (a slow drive renders a few thousand an hour). Rows come from another drive: only
+        well-formed ones for known items are taken, and nothing this copy already has is overwritten."""
+        self._refuse_linked_folders()
+        other._refuse_linked_folders()
+        with self._db() as db, other._db() as theirs:
+            for row in theirs.execute(f"SELECT id, {', '.join(_MEDIA)} FROM media WHERE thumb = 1 AND error IS NULL"):
+                res = dict(row)
+                item_id = res.pop("id")
+                if (item_id not in items or not _measured(res) or self.thumb_path(item_id).exists()
+                        or not regular(other.thumb_path(item_id))):
+                    continue
+                res["preview"] = int(bool(res["preview"]) and regular(other.preview_path(item_id)))
+                # The thumbnail goes last: its file is what marks this item as rendered.
+                pairs = [(other.preview_path(item_id), self.preview_path(item_id))] if res["preview"] else []
+                for src, dst in pairs + [(other.thumb_path(item_id), self.thumb_path(item_id))]:
+                    media.atomic(dst, lambda tmp, src=src: shutil.copyfile(src, tmp))
+                _store(db, item_id, res)
+
     def _unrendered(self, db: sqlite3.Connection, rows: list[dict]) -> list[dict]:
         known = {i for (i,) in db.execute("SELECT id FROM media")}
         return [r for r in rows if (r["id"] not in known or not self.thumb_path(r["id"]).exists())
@@ -403,6 +425,19 @@ class Cache:
         with self._db() as db:
             row = db.execute(f"{_SELECT} WHERE i.id = ?", (item_id,)).fetchone()
         return self._item(row) if row else None
+
+
+_DHASH = re.compile(r"[0-9a-f]{16}")
+
+
+def _measured(res: dict) -> bool:
+    """Whether a media row has the types a render writes; grouping and the viewer rely on them."""
+    def num(v) -> bool:
+        return v is None or (isinstance(v, (int, float)) and not isinstance(v, bool))
+    return (all(v is None or (isinstance(v, int) and v > 0) for v in (res["w"], res["h"]))
+            and all(num(res[k]) for k in ("sharp", "bright", "noise"))
+            and (res["dhash"] is None or (isinstance(res["dhash"], str) and bool(_DHASH.fullmatch(res["dhash"]))))
+            and res["preview"] in (0, 1, None))
 
 
 def _store(db: sqlite3.Connection, item_id: str, res: dict) -> int:

@@ -24,7 +24,7 @@ Use when the owner wants an external drive to hold a copy of the library. The dr
    photokeep verify <drive>/Photos --json
    ```
    Success: exit 0 and `"ok": true`.
-7. Render the drive's thumbnails, which sync leaves out (takes minutes):
+7. Render any thumbnails sync could not copy from the existing copy (usually none; quick):
    ```
    photokeep cache refresh <drive>/Photos
    ```

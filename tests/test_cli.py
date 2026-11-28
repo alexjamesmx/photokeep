@@ -26,7 +26,6 @@ def test_version_has_one_source():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text())
     assert "version" not in project["project"] and project["project"]["dynamic"] == ["version"]
     assert project["tool"]["hatch"]["version"]["path"] == "photokeep/__init__.py"
-    assert __version__ == "0.3.1"
 
 
 def _takeout(path: Path, *, sidecars: bool = True) -> Path:

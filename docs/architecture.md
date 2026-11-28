@@ -57,7 +57,7 @@ Files go first and the log last, so an interrupted import is finished by running
 
 ## Cache
 
-`cache/index.sqlite` holds one display row per item, derived from the folded log, `sources/` and the files. `cache/files.sqlite` remembers file hashes while size and mtime are unchanged. Thumbnails and previews are rendered by `photokeep cache refresh` and the viewer. A damaged cache is deleted and rebuilt; no data lives only there.
+`cache/index.sqlite` holds one display row per item, derived from the folded log, `sources/` and the files. `cache/files.sqlite` remembers file hashes while size and mtime are unchanged. Thumbnails and previews are rendered by `photokeep cache refresh` and the viewer; sync copies them to a copy that lacks them, since both hold the same originals. A damaged cache is deleted and rebuilt; no data lives only there.
 
 ## Viewer write path
 

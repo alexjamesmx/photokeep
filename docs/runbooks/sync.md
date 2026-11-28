@@ -36,4 +36,4 @@ Use when the owner asks to sync, back up or bring two copies level. Both copies 
    ```
    Success: `"ok": true`.
 
-Thumbnails are not rendered by sync. Run `photokeep cache refresh <copy>` if the viewer needs them.
+Sync copies the thumbnails and previews one copy rendered to the other. Run `photokeep cache refresh <copy>` to render any still missing.

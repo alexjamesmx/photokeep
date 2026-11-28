@@ -52,7 +52,7 @@ def metrics(thumb) -> dict:
     return {"sharp": float(lap.var()), "bright": float(g.mean()), "noise": noise, "dhash": dhash}
 
 
-def _atomic(dst: Path, write) -> None:
+def atomic(dst: Path, write) -> None:
     dst.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=dst.parent, prefix=f".{dst.name}.", suffix=".tmp")
     os.close(fd)
@@ -75,7 +75,7 @@ def _save_thumb(im, dst: Path):
     r = min(THUMB_SHORT / min(im.size), THUMB_LONG_MAX / max(im.size), 1.0)
     t = im.resize((max(1, round(im.width * r)), max(1, round(im.height * r))), Image.Resampling.LANCZOS,
                   reducing_gap=3.0)
-    _atomic(dst, lambda tmp: t.save(tmp, "JPEG", quality=80, optimize=True))
+    atomic(dst, lambda tmp: t.save(tmp, "JPEG", quality=80, optimize=True))
     return t
 
 
@@ -107,7 +107,7 @@ def _render_photo(item_id: str, src: Path, ext: str, out_dir: Path) -> dict:
         if ext == ".heic":
             p = im.copy()
             p.thumbnail((PREVIEW_LONG, PREVIEW_LONG), Image.Resampling.LANCZOS)
-            _atomic(cache_path("previews", item_id, out_dir),
+            atomic(cache_path("previews", item_id, out_dir),
                     lambda t: p.save(t, "JPEG", quality=82, optimize=True, progressive=True))
             res["preview"] = 1
         res.update(metrics(_save_thumb(im, cache_path("thumbs", item_id, out_dir))))
@@ -129,7 +129,7 @@ def _render_video(item_id: str, src: Path, duration: float | None, out_dir: Path
 
     for at in (min(1.0, (duration or 0) * 0.3), 0):
         try:
-            _atomic(cache_path("thumbs", item_id, out_dir), poster(at))
+            atomic(cache_path("thumbs", item_id, out_dir), poster(at))
             return {"thumb": 1}
         except RuntimeError as e:
             err = e
